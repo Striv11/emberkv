@@ -49,6 +49,8 @@ bash check.sh        # gofmt, go vet, tests
 - **WAL record = op + seqnum**: the DB logs `kind|seq|key|value`; replay rebuilds the memtable and resumes sequence numbering after the highest replayed seqnum.
 - **SSTable blocks cut at user-key boundaries**: every version of a key lives in one data block, so a point lookup is bloom check, binary search of the in-memory index, and one block read. Blocks are prefix-compressed with restart points every 16 entries, and each block, the bloom filter and the footer carry their own CRC32C.
 - **Atomic table creation**: the writer streams to `*.tmp`, fsyncs, then renames, so a crash never exposes a partial SSTable.
+- **Flush protocol with a single commit point**: create the next WAL segment, write the memtable to an L0 table, then append one MANIFEST edit (add table + advance `LogNum`). Before that edit recovery replays the old segment and deletes the orphan table; after it, older segments are obsolete and are deleted on open if a crash left them behind. The MANIFEST reuses the WAL framing, so an edit is all-or-nothing, and it is rewritten as a snapshot when it grows.
+- **Synchronous flush (for now)**: flushing blocks writers and readers under the DB lock. It keeps the protocol easy to reason about; background flush comes with compaction.
 - **Corruption = end of log**: a bad record ends replay rather than being skipped, so recovery never yields a non-prefix of history.
 
 ## Roadmap

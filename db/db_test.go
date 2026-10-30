@@ -117,7 +117,7 @@ func TestTornWALRecoversPrefix(t *testing.T) {
 		d.Put([]byte(fmt.Sprintf("k%d", i)), []byte("v"))
 	}
 	d.Close()
-	p := filepath.Join(dir, walName)
+	p := onlyWAL(t, dir)
 	st, _ := os.Stat(p)
 	if err := os.Truncate(p, st.Size()-3); err != nil {
 		t.Fatal(err)
@@ -184,4 +184,13 @@ func TestDecodeRejectsGarbage(t *testing.T) {
 			t.Errorf("decode(%v) accepted", p)
 		}
 	}
+}
+
+func onlyWAL(t *testing.T, dir string) string {
+	t.Helper()
+	m, _ := filepath.Glob(filepath.Join(dir, "*.log"))
+	if len(m) != 1 {
+		t.Fatalf("want one WAL segment, got %v", m)
+	}
+	return m[0]
 }
