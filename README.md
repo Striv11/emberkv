@@ -45,6 +45,8 @@ bash check.sh        # gofmt, go vet, tests
 
 ## Design decisions & trade-offs
 - **Single-file WAL with per-record CRC**: simple, and recovery is a linear scan. Segment rotation arrives with memtable flushes.
+- **Versioned memtable**: a skiplist ordered by (key asc, seqnum desc) keeps every version and tombstone, so a read at seqnum N is one seek, and later snapshot reads and compaction need no format change.
+- **WAL record = op + seqnum**: the DB logs `kind|seq|key|value`; replay rebuilds the memtable and resumes sequence numbering after the highest replayed seqnum.
 - **Corruption = end of log**: a bad record ends replay rather than being skipped, so recovery never yields a non-prefix of history.
 
 ## Roadmap
