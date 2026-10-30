@@ -47,6 +47,8 @@ bash check.sh        # gofmt, go vet, tests
 - **Single-file WAL with per-record CRC**: simple, and recovery is a linear scan. Segment rotation arrives with memtable flushes.
 - **Versioned memtable**: a skiplist ordered by (key asc, seqnum desc) keeps every version and tombstone, so a read at seqnum N is one seek, and later snapshot reads and compaction need no format change.
 - **WAL record = op + seqnum**: the DB logs `kind|seq|key|value`; replay rebuilds the memtable and resumes sequence numbering after the highest replayed seqnum.
+- **SSTable blocks cut at user-key boundaries**: every version of a key lives in one data block, so a point lookup is bloom check, binary search of the in-memory index, and one block read. Blocks are prefix-compressed with restart points every 16 entries, and each block, the bloom filter and the footer carry their own CRC32C.
+- **Atomic table creation**: the writer streams to `*.tmp`, fsyncs, then renames, so a crash never exposes a partial SSTable.
 - **Corruption = end of log**: a bad record ends replay rather than being skipped, so recovery never yields a non-prefix of history.
 
 ## Roadmap
