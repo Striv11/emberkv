@@ -55,6 +55,8 @@ bash check.sh        # gofmt, go vet, tests
 
 - **Scan = k-way merge + version collapse**: `DB.Scan(start, end, fn)` merges the memtable and every L0 table through a heap ordered by (key asc, seq desc), then a collapsing layer keeps only the newest version at or below the snapshot seqnum and hides tombstoned keys. The scan holds the read lock, so it sees one consistent snapshot; the callback must not re-enter the DB.
 
+- **Leveled compaction (synchronous)**: L0 tables may overlap; L1+ are sorted, non-overlapping runs. When L0 reaches `L0Trigger` tables, all of them plus the overlapping L1 tables are merged into new L1 tables; deeper levels compact one table (plus overlaps) down when they exceed `L1Size * 10^(n-1)`. The compaction's version edit (add outputs, remove inputs) is a single MANIFEST append, so a crash leaves either the old or the new file set and Open deletes the orphans. Because reads are always at the latest seqnum, only the newest version of each key is kept, and a tombstone is dropped when no deeper level overlaps its range. Point reads binary-search one table per level. Compaction currently runs inline under the DB lock after a flush, so reads are trivially consistent; moving it to a background goroutine is future work.
+
 ## Roadmap
 See [PLAN.md](PLAN.md). Day-by-day progress is in [WORKLOG.md](WORKLOG.md).
 

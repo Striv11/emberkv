@@ -44,6 +44,15 @@ type Options struct {
 	// MemtableSize is the approximate memtable size in bytes that triggers a
 	// flush to L0. Zero means 4 MiB.
 	MemtableSize int64
+	// L0Trigger is the number of L0 tables that triggers an L0→L1
+	// compaction. Zero means 4; a negative value disables compaction.
+	L0Trigger int
+	// L1Size is the target total size in bytes of level 1; each deeper level
+	// is 10x larger. Zero means 10 MiB.
+	L1Size int64
+	// TargetFileSize is the approximate size of compaction output tables.
+	// Zero means 2 MiB.
+	TargetFileSize int64
 }
 
 // DB is a durable key-value store. It is safe for concurrent use.
@@ -57,7 +66,10 @@ type DB struct {
 	logNum uint64
 	mem    *memtable.Table
 	tables map[uint64]*sstable.Reader
-	l0     []uint64 // live L0 file numbers, newest first
+	meta   map[uint64]manifest.FileMeta
+	// levels[0] holds L0 file numbers newest first (ranges may overlap).
+	// levels[i>0] hold non-overlapping files sorted by smallest key.
+	levels [numLevels][]uint64
 	seq    uint64
 	next   uint64 // next file number
 	closed bool
@@ -79,11 +91,20 @@ func Open(dir string, opts Options) (*DB, error) {
 	if opts.MemtableSize <= 0 {
 		opts.MemtableSize = defaultMemtableMax
 	}
+	if opts.L0Trigger == 0 {
+		opts.L0Trigger = 4
+	}
+	if opts.L1Size <= 0 {
+		opts.L1Size = 10 << 20
+	}
+	if opts.TargetFileSize <= 0 {
+		opts.TargetFileSize = 2 << 20
+	}
 	man, err := manifest.Open(filepath.Join(dir, manifestName))
 	if err != nil {
 		return nil, err
 	}
-	d := &DB{dir: dir, opts: opts, man: man, mem: memtable.New(), tables: map[uint64]*sstable.Reader{}}
+	d := &DB{dir: dir, opts: opts, man: man, mem: memtable.New(), tables: map[uint64]*sstable.Reader{}, meta: map[uint64]manifest.FileMeta{}}
 	if err := d.recover(); err != nil {
 		d.abandon()
 		return nil, err
@@ -117,10 +138,17 @@ func (d *DB) recover() error {
 			return fmt.Errorf("db: open table %d: %w", f.Num, err)
 		}
 		d.tables[f.Num] = r
-		d.l0 = append(d.l0, f.Num)
+		d.meta[f.Num] = f
+		if f.Level >= numLevels {
+			return fmt.Errorf("db: table %d at invalid level %d", f.Num, f.Level)
+		}
+		d.levels[f.Level] = append(d.levels[f.Level], f.Num)
 		if f.Num >= d.next {
 			d.next = f.Num + 1
 		}
+	}
+	for l := 1; l < numLevels; l++ {
+		d.sortLevel(l)
 	}
 	ents, err := os.ReadDir(d.dir)
 	if err != nil {
@@ -280,11 +308,12 @@ func (d *DB) flushLocked() error {
 	oldLog, oldNum := d.log, d.logNum
 	d.log, d.logNum, d.next = newLog, newLogNum, tableNum+1
 	d.tables[tableNum] = r
-	d.l0 = append([]uint64{tableNum}, d.l0...)
+	d.meta[tableNum] = meta
+	d.levels[0] = append([]uint64{tableNum}, d.levels[0]...)
 	d.mem = memtable.New()
 	oldLog.Close()
 	os.Remove(walPath(d.dir, oldNum))
-	return nil
+	return d.maybeCompactLocked()
 }
 
 func (d *DB) writeTable(num uint64) (manifest.FileMeta, error) {
@@ -328,16 +357,20 @@ func (d *DB) Get(key []byte) ([]byte, error) {
 		}
 		return v, nil
 	}
-	for _, n := range d.l0 { // newest table first; the first hit is the newest version
-		v, found, deleted, err := d.tables[n].Get(key, d.seq)
-		if err != nil {
-			return nil, err
-		}
-		if found {
-			if deleted {
-				return nil, ErrNotFound
+	// Shallower levels hold newer versions, and within L0 newer tables come
+	// first, so the first hit is the newest version.
+	for l := 0; l < numLevels; l++ {
+		for _, n := range d.candidates(l, key) {
+			v, found, deleted, err := d.tables[n].Get(key, d.seq)
+			if err != nil {
+				return nil, err
 			}
-			return v, nil
+			if found {
+				if deleted {
+					return nil, ErrNotFound
+				}
+				return v, nil
+			}
 		}
 	}
 	return nil, ErrNotFound
@@ -418,7 +451,7 @@ func (d *DB) Scan(start, end []byte, fn func(key, value []byte) bool) error {
 		return ErrClosed
 	}
 	srcs := []merge.Source{d.mem.NewIteratorFrom(start)}
-	for _, n := range d.l0 {
+	for _, n := range d.allTables() {
 		it := d.tables[n].NewIterator()
 		if start != nil {
 			it.Seek(start)
