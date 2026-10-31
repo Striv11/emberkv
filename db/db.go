@@ -18,6 +18,7 @@ import (
 
 	"github.com/Striv11/emberkv/manifest"
 	"github.com/Striv11/emberkv/memtable"
+	"github.com/Striv11/emberkv/merge"
 	"github.com/Striv11/emberkv/sstable"
 	"github.com/Striv11/emberkv/wal"
 )
@@ -403,4 +404,32 @@ func decode(p []byte) (seq uint64, kind memtable.Kind, key, value []byte, err er
 	}
 	p = p[n:]
 	return seq, kind, p[:klen], p[klen:], nil
+}
+
+// Scan calls fn for every live key in [start, end) in ascending order, at a
+// consistent snapshot. A nil start means the first key; a nil end means no
+// upper bound. fn returning false stops the scan. The key and value slices
+// are only valid during the call. fn must not call back into the DB, since
+// the scan holds the read lock.
+func (d *DB) Scan(start, end []byte, fn func(key, value []byte) bool) error {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if d.closed {
+		return ErrClosed
+	}
+	srcs := []merge.Source{d.mem.NewIteratorFrom(start)}
+	for _, n := range d.l0 {
+		it := d.tables[n].NewIterator()
+		if start != nil {
+			it.Seek(start)
+		}
+		srcs = append(srcs, it)
+	}
+	u := merge.NewUser(merge.New(srcs...), d.seq, end)
+	for u.Next() {
+		if !fn(u.Key(), u.Value()) {
+			return nil
+		}
+	}
+	return u.Err()
 }

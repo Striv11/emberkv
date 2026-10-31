@@ -25,3 +25,9 @@ Newest entries at the bottom. Each entry records what actually changed, what was
 **Tests:** manifest replay, torn-tail atomicity of an edit, snapshot rewrite, garbage decode; db flush/rotation/reopen, tombstones shadowing older tables, crash before the MANIFEST commit (orphan table + empty WAL), crash after it (resurrected stale WAL must not be replayed), corrupt table fails open, 30k-op randomized model check with flushes and reopens. All pass under `-race`.
 **Learned:** persisting `LastSeq` in the edit matters: once the WAL is deleted, the memtable is empty and sequence numbers would otherwise restart, letting old table data shadow new writes.
 **Next:** merging iterators across memtable and SSTables and `DB.Scan(start, end)`, model-checked. Flush is still synchronous under the DB lock; revisit with compaction.
+
+## 2026-10-31: Day 5, merging iterators + Scan
+**Changed:** Added `merge` package: a heap-based k-way `Iterator` over any sorted `Source` (memtable or SSTable iterators) ordered by (key asc, seq desc), and a `User` iterator that collapses versions (newest at or below the snapshot wins, tombstones hide the key, exclusive `end` bound). Added `memtable.NewIteratorFrom` for seeking. `DB.Scan(start, end, fn)` merges memtable plus all L0 tables under the read lock.
+**Tests:** merge order with empty sources, 1200-entry random merge vs sort, snapshot/tombstone/end-bound semantics, error propagation from a source; memtable seek; DB scan basics (overwrite, delete, early stop, closed) and a 15k-op randomized model check with flushes, reopens and random bounds.
+**Learned:** the version-collapse state (last resolved key) has to live on the iterator, not in `Next`, or older versions of an already-returned key look like fresh keys on the next call.
+**Next:** leveled compaction (L0 to L1 to Ln) with size targets, tombstone dropping at the bottom level, and moving flush/compaction off the DB lock.

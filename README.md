@@ -53,6 +53,8 @@ bash check.sh        # gofmt, go vet, tests
 - **Synchronous flush (for now)**: flushing blocks writers and readers under the DB lock. It keeps the protocol easy to reason about; background flush comes with compaction.
 - **Corruption = end of log**: a bad record ends replay rather than being skipped, so recovery never yields a non-prefix of history.
 
+- **Scan = k-way merge + version collapse**: `DB.Scan(start, end, fn)` merges the memtable and every L0 table through a heap ordered by (key asc, seq desc), then a collapsing layer keeps only the newest version at or below the snapshot seqnum and hides tombstoned keys. The scan holds the read lock, so it sees one consistent snapshot; the callback must not re-enter the DB.
+
 ## Roadmap
 See [PLAN.md](PLAN.md). Day-by-day progress is in [WORKLOG.md](WORKLOG.md).
 

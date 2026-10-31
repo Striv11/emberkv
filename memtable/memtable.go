@@ -161,6 +161,17 @@ func (t *Table) NewIterator() *Iterator {
 	return &Iterator{n: &node{next: []*node{t.head.next[0]}}}
 }
 
+// NewIteratorFrom returns an iterator positioned so the first call to Next
+// yields the first entry whose user key is >= key (newest version first).
+func (t *Table) NewIteratorFrom(key []byte) *Iterator {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return &Iterator{n: &node{next: []*node{t.findGE(key, ^uint64(0), nil)}}}
+}
+
+// Err always returns nil; it lets Iterator satisfy merge sources.
+func (it *Iterator) Err() error { return nil }
+
 // Next advances and reports whether an entry is available.
 func (it *Iterator) Next() bool {
 	if it.n == nil {

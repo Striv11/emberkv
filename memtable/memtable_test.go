@@ -113,3 +113,22 @@ func TestEmptyIterator(t *testing.T) {
 		t.Fatal("empty table yielded entry")
 	}
 }
+
+func TestIteratorFromSeeksToKey(t *testing.T) {
+	m := New()
+	m.Add(1, KindPut, []byte("a"), []byte("1"))
+	m.Add(2, KindPut, []byte("c"), []byte("2"))
+	m.Add(3, KindPut, []byte("c"), []byte("3"))
+	m.Add(4, KindPut, []byte("e"), []byte("4"))
+	it := m.NewIteratorFrom([]byte("b"))
+	var got []uint64
+	for it.Next() {
+		got = append(got, it.Entry().Seq)
+	}
+	if len(got) != 3 || got[0] != 3 || got[1] != 2 || got[2] != 4 {
+		t.Fatalf("got %v", got)
+	}
+	if NewIteratorFromEnd := m.NewIteratorFrom([]byte("z")); NewIteratorFromEnd.Next() {
+		t.Fatal("seek past end yielded entry")
+	}
+}
