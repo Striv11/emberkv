@@ -41,7 +41,19 @@ bash check.sh        # gofmt, go vet, tests
 ```
 
 ## Demo
-*Planned (Day 7):* `emberkv bench` and `emberkv crashtest`. The crash test repeatedly kills a writer process at random points, reopens the database, and verifies it against a model.
+```sh
+go run ./cmd/emberkv crashtest -iters 100   # kill -9 a writer 100 times, verify after each
+go run ./cmd/emberkv bench -n 100000        # fillseq, readrandom, scan
+```
+`crashtest` starts a child process that applies a deterministic stream of puts and deletes and prints `ack i` after each op returns (with fsync). The parent SIGKILLs it after a random 20-300 ms, reopens the database and checks that the recovered state equals the model after exactly the acknowledged ops, or those plus the one op in flight. Memtable and compaction thresholds are tiny so kills land mid-flush and mid-compaction. Sample run: 100 kills, 61k acknowledged ops, 0 lost.
+
+Sample `bench` output (no fsync, 100-byte values, one laptop-class VM):
+```
+fillseq         100000 ops    648856 ops/s     1.54 us/op
+readrandom      100000 ops    230229 ops/s     4.34 us/op
+scan            100000 ops   5476118 ops/s     0.18 us/op
+```
+Limits: `kill -9` tests process crashes, where the OS page cache survives; it does not simulate power loss or torn writes (the WAL tests cover truncation at every byte offset separately).
 
 ## Design decisions & trade-offs
 - **Single-file WAL with per-record CRC**: simple, and recovery is a linear scan. Segment rotation arrives with memtable flushes.
