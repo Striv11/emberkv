@@ -24,7 +24,7 @@ import (
 
 func crashOptions() db.Options {
 	// Tiny thresholds so kills land during flushes and compactions too.
-	return db.Options{MemtableSize: 16 << 10, L0Trigger: 2, L1Size: 64 << 10, TargetFileSize: 16 << 10}
+	return db.Options{MemtableSize: 16 << 10, L0Trigger: 2, L1Size: 64 << 10, TargetFileSize: 16 << 10, Background: true}
 }
 
 func ckey(i int) []byte { return []byte(fmt.Sprintf("key%08d", i)) }

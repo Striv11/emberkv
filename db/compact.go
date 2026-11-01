@@ -81,50 +81,49 @@ func (d *DB) overlapping(l int, lo, hi []byte) []uint64 {
 	return out
 }
 
-// maybeCompactLocked runs compactions until no level exceeds its target.
-// d.mu must be held for writing.
-func (d *DB) maybeCompactLocked() error {
+// compaction is a unit of work chosen under the lock: the tables to merge
+// and whether tombstones may be dropped.
+type compaction struct {
+	level  int
+	inputs []uint64 // from level
+	all    []uint64 // inputs plus overlapping tables of level+1
+	bottom bool
+	srcs   []merge.Source
+}
+
+// pickLocked chooses the next compaction, or nil if every level is within
+// its target. d.mu must be held (read or write).
+func (d *DB) pickLocked() *compaction {
 	if d.opts.L0Trigger < 0 {
 		return nil
 	}
-	for {
-		var inputs []uint64
-		level := -1
-		if len(d.levels[0]) >= d.opts.L0Trigger {
-			level, inputs = 0, append([]uint64(nil), d.levels[0]...)
-		} else {
-			for l := 1; l < numLevels-1; l++ {
-				if d.levelSize(l) > d.levelTarget(l) {
-					// Oldest table first: a simple policy that cycles through the level.
-					oldest := d.levels[l][0]
-					for _, n := range d.levels[l] {
-						if n < oldest {
-							oldest = n
-						}
+	level := -1
+	var inputs []uint64
+	if len(d.levels[0]) >= d.opts.L0Trigger {
+		level, inputs = 0, append([]uint64(nil), d.levels[0]...)
+	} else {
+		for l := 1; l < numLevels-1; l++ {
+			if d.levelSize(l) > d.levelTarget(l) {
+				// Oldest table first: a simple policy that cycles through the level.
+				oldest := d.levels[l][0]
+				for _, n := range d.levels[l] {
+					if n < oldest {
+						oldest = n
 					}
-					level, inputs = l, []uint64{oldest}
-					break
 				}
+				level, inputs = l, []uint64{oldest}
+				break
 			}
 		}
-		if level < 0 {
-			return nil
-		}
-		if err := d.compactLocked(level, inputs); err != nil {
-			return err
-		}
 	}
+	if level < 0 {
+		return nil
+	}
+	return d.planLocked(level, inputs)
 }
 
-// compactLocked merges inputs (from level) and every overlapping table of
-// level+1 into new tables at level+1.
-//
-// The version edit that removes the inputs and adds the outputs is the single
-// commit point. Before it, outputs are orphans that Open deletes; after it,
-// the inputs are orphans that Open deletes. Only the newest version of each
-// key is kept, since reads are always at the latest sequence number. A
-// tombstone is dropped when no deeper level overlaps the compacted range.
-func (d *DB) compactLocked(level int, inputs []uint64) error {
+// planLocked expands inputs (tables of level) into a full compaction.
+func (d *DB) planLocked(level int, inputs []uint64) *compaction {
 	out := level + 1
 	lo, hi := d.meta[inputs[0]].Smallest, d.meta[inputs[0]].Largest
 	widen := func(ns []uint64) {
@@ -141,25 +140,59 @@ func (d *DB) compactLocked(level int, inputs []uint64) error {
 	widen(inputs)
 	lower := d.overlapping(out, lo, hi)
 	widen(lower)
-	all := append(append([]uint64(nil), inputs...), lower...)
-	bottom := true
-	for l := out + 1; l < numLevels && bottom; l++ {
+	c := &compaction{level: level, inputs: inputs, bottom: true}
+	c.all = append(append([]uint64(nil), inputs...), lower...)
+	for l := out + 1; l < numLevels && c.bottom; l++ {
 		if len(d.overlapping(l, lo, hi)) > 0 {
-			bottom = false
+			c.bottom = false
 		}
 	}
-
-	var srcs []merge.Source
-	for _, n := range all {
-		srcs = append(srcs, d.tables[n].NewIterator())
+	for _, n := range c.all {
+		c.srcs = append(c.srcs, d.tables[n].NewIterator())
 	}
-	it := merge.New(srcs...)
+	return c
+}
+
+// maybeCompactLocked runs compactions inline until no level exceeds its
+// target. d.mu must be held for writing.
+func (d *DB) maybeCompactLocked() error {
+	for {
+		c := d.pickLocked()
+		if c == nil {
+			return nil
+		}
+		if err := d.runLocked(c); err != nil {
+			return err
+		}
+	}
+}
+
+// compactLocked forces a compaction of the given tables of level.
+func (d *DB) compactLocked(level int, inputs []uint64) error {
+	return d.runLocked(d.planLocked(level, inputs))
+}
+
+func (d *DB) runLocked(c *compaction) error {
+	outputs, err := d.buildCompaction(c, func() uint64 { n := d.next; d.next++; return n })
+	if err != nil {
+		return err
+	}
+	return d.installCompactionLocked(c, outputs)
+}
+
+// buildCompaction merges c's inputs into new tables at level+1. It touches
+// only immutable tables and the file-number allocator, so it may run without
+// d.mu. On error it removes any partial output. Only the newest version of
+// each key is kept, since reads are always at the latest sequence number. A
+// tombstone is dropped when no deeper level overlaps the compacted range.
+func (d *DB) buildCompaction(c *compaction, alloc func() uint64) ([]manifest.FileMeta, error) {
+	out := c.level + 1
+	it := merge.New(c.srcs...)
 
 	var outputs []manifest.FileMeta
 	var w *sstable.Writer
 	var cur manifest.FileMeta
 	var curBytes int64
-	next := d.next
 	cleanup := func() {
 		if w != nil {
 			w.Abort()
@@ -192,46 +225,57 @@ func (d *DB) compactLocked(level int, inputs []uint64) error {
 			continue // older version of a key already handled
 		}
 		lastKey, haveLast = append(lastKey[:0], e.Key...), true
-		if e.Kind == memtable.KindDelete && bottom {
+		if e.Kind == memtable.KindDelete && c.bottom {
 			continue
 		}
 		if w != nil && curBytes >= d.opts.TargetFileSize {
 			if err := finish(); err != nil {
 				cleanup()
-				return err
+				return nil, err
 			}
 		}
 		if w == nil {
+			num := alloc()
 			var err error
-			if w, err = sstable.NewWriter(sstPath(d.dir, next)); err != nil {
+			if w, err = sstable.NewWriter(sstPath(d.dir, num)); err != nil {
 				cleanup()
-				return err
+				return nil, err
 			}
-			cur, curBytes = manifest.FileMeta{Num: next, Level: out, Smallest: append([]byte(nil), e.Key...)}, 0
-			next++
+			cur, curBytes = manifest.FileMeta{Num: num, Level: out, Smallest: append([]byte(nil), e.Key...)}, 0
 		}
 		cur.Largest = append(cur.Largest[:0], e.Key...)
 		curBytes += int64(len(e.Key) + len(e.Value) + 8)
 		if err := w.Add(e); err != nil {
 			cleanup()
-			return err
+			return nil, err
 		}
 	}
 	if err := it.Err(); err != nil {
 		cleanup()
-		return err
+		return nil, err
 	}
 	if err := finish(); err != nil {
 		cleanup()
-		return err
+		return nil, err
 	}
+	return outputs, nil
+}
 
+// installCompactionLocked commits a built compaction. The version edit that
+// removes the inputs and adds the outputs is the single commit point. Before
+// it, outputs are orphans that Open deletes; after it, the inputs are orphans
+// that Open deletes. On error the outputs are removed. d.mu must be held for
+// writing.
+func (d *DB) installCompactionLocked(c *compaction, outputs []manifest.FileMeta) error {
+	level, out, all := c.level, c.level+1, c.all
 	readers := make(map[uint64]*sstable.Reader, len(outputs))
 	closeNew := func() {
 		for _, r := range readers {
 			r.Close()
 		}
-		cleanup()
+		for _, m := range outputs {
+			os.Remove(sstPath(d.dir, m.Num))
+		}
 	}
 	for _, m := range outputs {
 		r, err := sstable.Open(sstPath(d.dir, m.Num))
@@ -241,13 +285,12 @@ func (d *DB) compactLocked(level int, inputs []uint64) error {
 		}
 		readers[m.Num] = r
 	}
-	if err := d.man.Apply(manifest.Edit{NextFile: next, Added: outputs, Removed: all}); err != nil {
+	if err := d.man.Apply(manifest.Edit{NextFile: d.next, Added: outputs, Removed: all}); err != nil {
 		closeNew()
 		return err
 	}
 
 	// Committed: swap in-memory state, then delete the obsolete tables.
-	d.next = next
 	removed := make(map[uint64]bool, len(all))
 	for _, n := range all {
 		removed[n] = true
@@ -274,6 +317,70 @@ func (d *DB) compactLocked(level int, inputs []uint64) error {
 		os.Remove(sstPath(d.dir, n))
 	}
 	return nil
+}
+
+// compactLoop is the background compactor. It builds merged tables without
+// holding d.mu, so reads and writes proceed meanwhile, and takes the lock only
+// to pick work and to install the result. Flushes only add L0 tables newer
+// than any input, so they never conflict with a build in flight.
+func (d *DB) compactLoop() {
+	defer d.wg.Done()
+	alloc := func() uint64 {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		n := d.next
+		d.next++
+		return n
+	}
+	for {
+		d.mu.Lock()
+		var c *compaction
+		if !d.closed && d.bgErr == nil {
+			c = d.pickLocked()
+		}
+		d.compacting = c != nil
+		if c == nil {
+			d.cond.Broadcast()
+			d.mu.Unlock()
+			if _, ok := <-d.kick; !ok {
+				return
+			}
+			continue
+		}
+		d.mu.Unlock()
+
+		outputs, err := d.buildCompaction(c, alloc)
+
+		d.mu.Lock()
+		if err == nil && d.closed {
+			for _, m := range outputs {
+				os.Remove(sstPath(d.dir, m.Num))
+			}
+		} else if err == nil {
+			err = d.installCompactionLocked(c, outputs)
+		}
+		if err != nil && d.bgErr == nil {
+			d.bgErr = err
+		}
+		d.compacting = false
+		d.cond.Broadcast()
+		d.mu.Unlock()
+	}
+}
+
+// WaitCompaction blocks until background compaction is idle (nothing to do
+// or failed) and returns the background error, if any. In synchronous mode it
+// returns immediately.
+func (d *DB) WaitCompaction() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if !d.opts.Background {
+		return nil
+	}
+	for !d.closed && d.bgErr == nil && (d.compacting || d.pickLocked() != nil) {
+		d.cond.Wait()
+	}
+	return d.bgErr
 }
 
 // LevelCounts returns the number of live tables per level (for tests and diagnostics).

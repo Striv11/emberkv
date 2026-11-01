@@ -43,3 +43,9 @@ Newest entries at the bottom. Each entry records what actually changed, what was
 **Tests:** CLI tests build the binary and run an 8-iteration crashtest and a small bench; a unit test checks the verifier rejects a DB missing acknowledged ops. A 100-iteration run passed (61k acked ops, 0 lost). Bench: about 650k fillseq/s, 230k readrandom/s without fsync.
 **Learned:** with strictly sequential ops the recovered state has only two legal outcomes, which makes the check exact rather than "at least the acked keys".
 **Not done:** kill -9 keeps the page cache, so this is not power-loss testing; Day 6 background compaction is still open. Next: fault-injecting FS for power loss, then background flush/compaction.
+
+## 2026-11-01 (later): background compaction
+**Changed:** Split compaction into pick/plan, build (no lock) and install (lock, one MANIFEST edit). `Options.Background` starts a compactor goroutine that merges without holding the DB lock; writers stall only when L0 reaches 3x `L0Trigger`; `Close` waits for it and discards unfinished output; `WaitCompaction` exposes idleness/errors. Sync mode is unchanged. `crashtest` now runs with the background compactor. Day 6 is fully ticked.
+**Tests:** background data movement and reopen, a 15k-op model check with concurrent Get/Scan readers and periodic reopens, repeated close-while-compacting; all under `-race`. 100-iteration crashtest: 71k acked ops, 0 lost.
+**Learned:** flushes only prepend newer L0 tables and only the compactor touches deeper levels, so a single compactor needs no input pinning; the only shared state is the file-number allocator.
+**Next:** background flush (writers still block during a flush), a fault-injecting FS for power-loss tests, block cache.

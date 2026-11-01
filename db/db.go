@@ -53,6 +53,10 @@ type Options struct {
 	// TargetFileSize is the approximate size of compaction output tables.
 	// Zero means 2 MiB.
 	TargetFileSize int64
+	// Background runs compaction in a goroutine so writers and readers are
+	// not blocked while tables are merged. Writers stall only when L0 grows
+	// to three times L0Trigger tables.
+	Background bool
 }
 
 // DB is a durable key-value store. It is safe for concurrent use.
@@ -73,6 +77,13 @@ type DB struct {
 	seq    uint64
 	next   uint64 // next file number
 	closed bool
+
+	// Background compaction state (guarded by mu).
+	cond       *sync.Cond
+	kick       chan struct{}
+	wg         sync.WaitGroup
+	compacting bool
+	bgErr      error
 }
 
 func walPath(dir string, num uint64) string {
@@ -105,9 +116,18 @@ func Open(dir string, opts Options) (*DB, error) {
 		return nil, err
 	}
 	d := &DB{dir: dir, opts: opts, man: man, mem: memtable.New(), tables: map[uint64]*sstable.Reader{}, meta: map[uint64]manifest.FileMeta{}}
+	d.cond = sync.NewCond(&d.mu)
 	if err := d.recover(); err != nil {
 		d.abandon()
 		return nil, err
+	}
+	if opts.Background && opts.L0Trigger > 0 {
+		d.kick = make(chan struct{}, 1)
+		d.wg.Add(1)
+		go d.compactLoop()
+		d.kickCompaction() // recovery may have left work behind
+	} else {
+		d.opts.Background = false
 	}
 	return d, nil
 }
@@ -237,6 +257,15 @@ func (d *DB) write(kind memtable.Kind, key, value []byte) error {
 	if d.closed {
 		return ErrClosed
 	}
+	for d.opts.Background && !d.closed && d.bgErr == nil && len(d.levels[0]) >= 3*d.opts.L0Trigger {
+		d.cond.Wait() // L0 stall: let the compactor catch up
+	}
+	if d.closed {
+		return ErrClosed
+	}
+	if d.bgErr != nil {
+		return d.bgErr
+	}
 	seq := d.seq + 1
 	if err := d.log.Append(encode(seq, kind, key, value)); err != nil {
 		return err
@@ -313,7 +342,19 @@ func (d *DB) flushLocked() error {
 	d.mem = memtable.New()
 	oldLog.Close()
 	os.Remove(walPath(d.dir, oldNum))
+	if d.opts.Background {
+		d.kickCompaction()
+		return nil
+	}
 	return d.maybeCompactLocked()
+}
+
+// kickCompaction wakes the background compactor (non-blocking).
+func (d *DB) kickCompaction() {
+	select {
+	case d.kick <- struct{}{}:
+	default:
+	}
 }
 
 func (d *DB) writeTable(num uint64) (manifest.FileMeta, error) {
@@ -395,6 +436,13 @@ func (d *DB) Close() error {
 		return ErrClosed
 	}
 	d.closed = true
+	d.cond.Broadcast()
+	if d.kick != nil {
+		close(d.kick)
+		d.mu.Unlock()
+		d.wg.Wait() // the compactor sees closed and discards unfinished output
+		d.mu.Lock()
+	}
 	err := d.log.Close()
 	for _, r := range d.tables {
 		if cerr := r.Close(); err == nil {
