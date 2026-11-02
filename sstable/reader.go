@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync/atomic"
 
 	"github.com/Striv11/emberkv/memtable"
 )
@@ -33,7 +34,16 @@ type Reader struct {
 	index []indexEntry
 	bloom *bloom
 	count uint64
+
+	id    uint64 // unique per Reader; part of the block cache key
+	cache *Cache
 }
+
+var nextReaderID atomic.Uint64
+
+// SetCache makes the Reader serve data blocks through c. Call it before the
+// Reader is shared between goroutines. A nil cache disables caching.
+func (r *Reader) SetCache(c *Cache) { r.cache = c }
 
 // Open opens and validates a table: footer, index and bloom filter are
 // checksummed and parsed eagerly; data blocks are verified when read.
@@ -78,7 +88,7 @@ func newReader(f *os.File) (*Reader, error) {
 	if idxOff > limit || idxLen > limit-idxOff || blOff > limit || blLen > limit-blOff {
 		return nil, errCorrupt("footer offsets out of range")
 	}
-	r := &Reader{f: f, count: count}
+	r := &Reader{f: f, count: count, id: nextReaderID.Add(1)}
 
 	raw, err := r.readAt(idxOff, idxLen)
 	if err != nil {
@@ -124,18 +134,33 @@ func (r *Reader) readAt(off, n uint64) ([]byte, error) {
 }
 
 func (r *Reader) readBlock(i int) (*block, error) {
+	key := cacheKey{r.id, i}
+	if r.cache != nil {
+		if b, ok := r.cache.get(key); ok {
+			return b, nil
+		}
+	}
 	raw, err := r.readAt(r.index[i].off, r.index[i].length)
 	if err != nil {
 		return nil, err
 	}
-	return parseBlock(raw)
+	b, err := parseBlock(raw)
+	if err == nil && r.cache != nil {
+		r.cache.put(key, b)
+	}
+	return b, err
 }
 
 // Len returns the number of entries (versions and tombstones).
 func (r *Reader) Len() int { return int(r.count) }
 
 // Close releases the file.
-func (r *Reader) Close() error { return r.f.Close() }
+func (r *Reader) Close() error {
+	if r.cache != nil {
+		r.cache.dropReader(r.id)
+	}
+	return r.f.Close()
+}
 
 // blockFor returns the index of the only block that can hold key, or -1.
 func (r *Reader) blockFor(key []byte) int {

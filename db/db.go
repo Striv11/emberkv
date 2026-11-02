@@ -57,6 +57,9 @@ type Options struct {
 	// not blocked while tables are merged. Writers stall only when L0 grows
 	// to three times L0Trigger tables.
 	Background bool
+	// BlockCacheSize is the capacity in bytes of the shared LRU cache of
+	// SSTable data blocks. Zero means 8 MiB; a negative value disables it.
+	BlockCacheSize int64
 }
 
 // DB is a durable key-value store. It is safe for concurrent use.
@@ -69,6 +72,7 @@ type DB struct {
 	log    *wal.Log
 	logNum uint64
 	mem    *memtable.Table
+	cache  *sstable.Cache // nil when disabled
 	tables map[uint64]*sstable.Reader
 	meta   map[uint64]manifest.FileMeta
 	// levels[0] holds L0 file numbers newest first (ranges may overlap).
@@ -94,6 +98,23 @@ func sstPath(dir string, num uint64) string {
 	return filepath.Join(dir, fmt.Sprintf("%06d.sst", num))
 }
 
+// openTable opens table num and attaches the block cache.
+func (d *DB) openTable(num uint64) (*sstable.Reader, error) {
+	r, err := sstable.Open(sstPath(d.dir, num))
+	if err == nil {
+		r.SetCache(d.cache)
+	}
+	return r, err
+}
+
+// CacheStats returns block cache counters (zero if the cache is disabled).
+func (d *DB) CacheStats() sstable.CacheStats {
+	if d.cache == nil {
+		return sstable.CacheStats{}
+	}
+	return d.cache.Stats()
+}
+
 // Open opens or creates a database in dir.
 func Open(dir string, opts Options) (*DB, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -116,6 +137,12 @@ func Open(dir string, opts Options) (*DB, error) {
 		return nil, err
 	}
 	d := &DB{dir: dir, opts: opts, man: man, mem: memtable.New(), tables: map[uint64]*sstable.Reader{}, meta: map[uint64]manifest.FileMeta{}}
+	switch {
+	case opts.BlockCacheSize == 0:
+		d.cache = sstable.NewCache(8 << 20)
+	case opts.BlockCacheSize > 0:
+		d.cache = sstable.NewCache(opts.BlockCacheSize)
+	}
 	d.cond = sync.NewCond(&d.mu)
 	if err := d.recover(); err != nil {
 		d.abandon()
@@ -153,7 +180,7 @@ func (d *DB) recover() error {
 	// Open live tables; delete files the MANIFEST does not know about
 	// (outputs of a flush that crashed before its version edit).
 	for _, f := range st.Sorted() {
-		r, err := sstable.Open(sstPath(d.dir, f.Num))
+		r, err := d.openTable(f.Num)
 		if err != nil {
 			return fmt.Errorf("db: open table %d: %w", f.Num, err)
 		}
@@ -317,7 +344,7 @@ func (d *DB) flushLocked() error {
 		os.Remove(walPath(d.dir, newLogNum))
 		return err
 	}
-	r, err := sstable.Open(sstPath(d.dir, tableNum))
+	r, err := d.openTable(tableNum)
 	if err != nil {
 		newLog.Close()
 		return err

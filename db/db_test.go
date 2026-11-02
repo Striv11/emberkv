@@ -194,3 +194,30 @@ func onlyWAL(t *testing.T, dir string) string {
 	}
 	return m[0]
 }
+
+func TestBlockCacheServesRepeatedReads(t *testing.T) {
+	d, err := Open(t.TempDir(), Options{NoSync: true, MemtableSize: 4 << 10, L0Trigger: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	for i := 0; i < 500; i++ {
+		if err := d.Put([]byte(fmt.Sprintf("k%04d", i)), []byte("value-value-value")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := d.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	for pass := 0; pass < 3; pass++ {
+		for i := 0; i < 500; i++ {
+			v, err := d.Get([]byte(fmt.Sprintf("k%04d", i)))
+			if err != nil || string(v) != "value-value-value" {
+				t.Fatalf("get %d: %q %v", i, v, err)
+			}
+		}
+	}
+	if s := d.CacheStats(); s.Hits == 0 || s.Hits < s.Misses {
+		t.Fatalf("cache ineffective: %+v", s)
+	}
+}

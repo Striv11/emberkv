@@ -278,7 +278,7 @@ func (d *DB) installCompactionLocked(c *compaction, outputs []manifest.FileMeta)
 		}
 	}
 	for _, m := range outputs {
-		r, err := sstable.Open(sstPath(d.dir, m.Num))
+		r, err := d.openTable(m.Num)
 		if err != nil {
 			closeNew()
 			return err

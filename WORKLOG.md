@@ -49,3 +49,9 @@ Newest entries at the bottom. Each entry records what actually changed, what was
 **Tests:** background data movement and reopen, a 15k-op model check with concurrent Get/Scan readers and periodic reopens, repeated close-while-compacting; all under `-race`. 100-iteration crashtest: 71k acked ops, 0 lost.
 **Learned:** flushes only prepend newer L0 tables and only the compactor touches deeper levels, so a single compactor needs no input pinning; the only shared state is the file-number allocator.
 **Next:** background flush (writers still block during a flush), a fault-injecting FS for power-loss tests, block cache.
+
+## 2026-11-02: block cache
+**Changed:** Added `sstable.Cache`, a byte-bounded LRU of parsed data blocks shared across readers (`Reader.SetCache`), with hit/miss/eviction counters. `db` creates one per DB (`Options.BlockCacheSize`, default 8 MiB, negative disables), attaches it to every table it opens (recovery, flush, compaction output) and exposes `DB.CacheStats()`. Closing a reader drops its blocks so compacted-away tables do not pin memory.
+**Tests:** cached and uncached readers return identical results; repeated passes are mostly hits; capacity is respected and evicts; LRU order; blocks dropped on close; 8 concurrent readers under `-race`; DB-level repeated reads produce hits.
+**Learned:** because blocks are immutable once parsed and `Get` copies values out, the cache can hand out shared pointers with no refcounting.
+**Next:** background flush, snapshots/MVCC reads (needs compaction to pin old versions), power-loss fault-injecting FS.
