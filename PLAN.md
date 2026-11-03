@@ -17,4 +17,4 @@ Seven-day arc. Every milestone has acceptance criteria that can be checked by a 
 - Move *flush* to a background goroutine too (compaction is done)
 - [x] Block cache (LRU) and its metrics
 - Snapshots / MVCC reads at a seqnum
-- Prometheus-style stats endpoint
+- [x] Prometheus-style stats endpoint

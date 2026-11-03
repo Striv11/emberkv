@@ -316,6 +316,7 @@ func (d *DB) installCompactionLocked(c *compaction, outputs []manifest.FileMeta)
 		delete(d.meta, n)
 		os.Remove(sstPath(d.dir, n))
 	}
+	d.nCompactions.Add(1)
 	return nil
 }
 

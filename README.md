@@ -44,6 +44,7 @@ bash check.sh        # gofmt, go vet, tests
 ```sh
 go run ./cmd/emberkv crashtest -iters 100   # kill -9 a writer 100 times, verify after each
 go run ./cmd/emberkv bench -n 100000        # fillseq, readrandom, scan
+go run ./cmd/emberkv stats -dir DIR         # Prometheus-format metrics (-listen ADDR serves /metrics)
 ```
 `crashtest` starts a child process that applies a deterministic stream of puts and deletes and prints `ack i` after each op returns (with fsync). The parent SIGKILLs it after a random 20-300 ms, reopens the database and checks that the recovered state equals the model after exactly the acknowledged ops, or those plus the one op in flight. Memtable and compaction thresholds are tiny so kills land mid-flush and mid-compaction. Sample run: 100 kills, 61k acknowledged ops, 0 lost.
 
@@ -70,6 +71,7 @@ Limits: `kill -9` tests process crashes, where the OS page cache survives; it do
 - **Leveled compaction (synchronous)**: L0 tables may overlap; L1+ are sorted, non-overlapping runs. When L0 reaches `L0Trigger` tables, all of them plus the overlapping L1 tables are merged into new L1 tables; deeper levels compact one table (plus overlaps) down when they exceed `L1Size * 10^(n-1)`. The compaction's version edit (add outputs, remove inputs) is a single MANIFEST append, so a crash leaves either the old or the new file set and Open deletes the orphans. Because reads are always at the latest seqnum, only the newest version of each key is kept, and a tombstone is dropped when no deeper level overlaps its range. Point reads binary-search one table per level. 
 - **Background compaction (`Options.Background`)**: a compactor goroutine picks work under the lock, merges the inputs *without* the lock (inputs are immutable and flushes only add newer L0 tables, so they cannot conflict), then retakes the lock to install the result with the same single MANIFEST edit. Readers and writers continue during the merge; writers stall only if L0 reaches 3x `L0Trigger`. `Close` waits for the compactor, which discards unfinished output. Without the option, compaction runs inline after a flush. `crashtest` runs with the background compactor on.
 - **Block cache**: one LRU cache (`Options.BlockCacheSize`, default 8 MiB, negative disables) is shared by every SSTable reader. It stores verified, parsed data blocks keyed by (reader, block), so a hit skips the pread, the CRC and the parse. Blocks are immutable, so they are shared without copying; a reader's blocks are dropped when its table is closed (e.g. after compaction). `DB.CacheStats()` exposes hits, misses, evictions and bytes.
+- **Metrics**: `DB.Stats()` returns operation counters (atomics, no lock on the hot path), flush/compaction counts and, under a read lock, per-level table counts and bytes plus block cache stats. The `metrics` package renders them in Prometheus text format and provides an `http.Handler`; `emberkv stats` prints or serves them. Counters are per process lifetime, as Prometheus expects.
 
 ## Roadmap
 See [PLAN.md](PLAN.md). Day-by-day progress is in [WORKLOG.md](WORKLOG.md).

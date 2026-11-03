@@ -2,6 +2,7 @@
 //
 //	emberkv bench     [-n 100000] [-value 100] [-sync=false] [-dir DIR]
 //	emberkv crashtest [-iters 100] [-seed N] [-dir DIR]
+//	emberkv stats     -dir DIR [-listen ADDR]
 package main
 
 import (
@@ -20,6 +21,8 @@ func main() {
 		err = runBench(os.Args[2:])
 	case "crashtest":
 		err = runCrashTest(os.Args[2:])
+	case "stats":
+		err = runStats(os.Args[2:])
 	case "crashwriter": // internal: the child process killed by crashtest
 		err = runCrashWriter(os.Args[2:])
 	default:
@@ -33,5 +36,5 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: emberkv bench|crashtest [flags]")
+	fmt.Fprintln(os.Stderr, "usage: emberkv bench|crashtest|stats [flags]")
 }

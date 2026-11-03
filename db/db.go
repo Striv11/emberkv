@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/Striv11/emberkv/manifest"
 	"github.com/Striv11/emberkv/memtable"
@@ -88,6 +89,9 @@ type DB struct {
 	wg         sync.WaitGroup
 	compacting bool
 	bgErr      error
+
+	// Metrics (atomic; readable without mu).
+	nPuts, nDeletes, nGets, nScans, nFlushes, nCompactions atomic.Uint64
 }
 
 func walPath(dir string, num uint64) string {
@@ -297,6 +301,11 @@ func (d *DB) write(kind memtable.Kind, key, value []byte) error {
 	if err := d.log.Append(encode(seq, kind, key, value)); err != nil {
 		return err
 	}
+	if kind == memtable.KindDelete {
+		d.nDeletes.Add(1)
+	} else {
+		d.nPuts.Add(1)
+	}
 	d.seq = seq
 	d.mem.Add(seq, kind, key, value)
 	if d.mem.Size() >= d.opts.MemtableSize {
@@ -367,6 +376,7 @@ func (d *DB) flushLocked() error {
 	d.meta[tableNum] = meta
 	d.levels[0] = append([]uint64{tableNum}, d.levels[0]...)
 	d.mem = memtable.New()
+	d.nFlushes.Add(1)
 	oldLog.Close()
 	os.Remove(walPath(d.dir, oldNum))
 	if d.opts.Background {
@@ -413,6 +423,7 @@ func (d *DB) writeTable(num uint64) (manifest.FileMeta, error) {
 
 // Get returns the value for key, or ErrNotFound.
 func (d *DB) Get(key []byte) ([]byte, error) {
+	d.nGets.Add(1)
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	if d.closed {
@@ -520,6 +531,7 @@ func decode(p []byte) (seq uint64, kind memtable.Kind, key, value []byte, err er
 // are only valid during the call. fn must not call back into the DB, since
 // the scan holds the read lock.
 func (d *DB) Scan(start, end []byte, fn func(key, value []byte) bool) error {
+	d.nScans.Add(1)
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	if d.closed {

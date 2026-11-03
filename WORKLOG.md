@@ -55,3 +55,9 @@ Newest entries at the bottom. Each entry records what actually changed, what was
 **Tests:** cached and uncached readers return identical results; repeated passes are mostly hits; capacity is respected and evicts; LRU order; blocks dropped on close; 8 concurrent readers under `-race`; DB-level repeated reads produce hits.
 **Learned:** because blocks are immutable once parsed and `Get` copies values out, the cache can hand out shared pointers with no refcounting.
 **Next:** background flush, snapshots/MVCC reads (needs compaction to pin old versions), power-loss fault-injecting FS.
+
+## 2026-11-03: stats and metrics endpoint
+**Changed:** Added `DB.Stats()` (put/delete/get/scan counters, flush and compaction counts, memtable bytes, last seqnum, per-level tables and bytes, block cache stats). New `metrics` package renders it as Prometheus text and exposes an `http.Handler`; `emberkv stats -dir DIR [-listen ADDR]` prints or serves it. Plan stretch item ticked.
+**Tests:** DB counters and level gauges against `LevelCounts` after flushes and compactions; handler served over `httptest` with exact sample lines and a format check; passes under `-race`.
+**Learned:** op counters as atomics keep `Stats` cheap, but gauges need the read lock for a consistent per-level view.
+**Next:** background flush, snapshots (compaction must pin old versions and table readers), power-loss fault-injecting FS.
