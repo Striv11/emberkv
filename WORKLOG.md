@@ -61,3 +61,9 @@ Newest entries at the bottom. Each entry records what actually changed, what was
 **Tests:** DB counters and level gauges against `LevelCounts` after flushes and compactions; handler served over `httptest` with exact sample lines and a format check; passes under `-race`.
 **Learned:** op counters as atomics keep `Stats` cheap, but gauges need the read lock for a consistent per-level view.
 **Next:** background flush, snapshots (compaction must pin old versions and table readers), power-loss fault-injecting FS.
+
+## 2026-11-03 (later): snapshots
+**Changed:** Added `DB.NewSnapshot()` with `Snapshot.Get/Scan/Release`, reading at a pinned seqnum. Compaction now takes the live snapshot seqnums when planned and keeps the newest version of each key plus the newest version visible to every snapshot; bottom tombstones are dropped only when no snapshot predates them. Compaction output is now cut only at user-key boundaries.
+**Tests:** isolation against later puts/deletes; two model-checked runs (sync and background, 6000 ops, snapshots taken and released mid-stream) comparing every snapshot's Scan and Get to its model after compaction; reclamation still works with no snapshots; closed-DB behaviour. Pass under `-race`.
+**Learned:** the model check's Scan passed while point Get failed: retained versions of one key had been split across two output files and Get probes only one table per level. Cutting at key boundaries fixed it.
+**Next:** background flush, power-loss fault-injecting FS.

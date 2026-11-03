@@ -90,6 +90,8 @@ type DB struct {
 	compacting bool
 	bgErr      error
 
+	snaps map[uint64]int // live snapshot seqnum -> refcount (guarded by mu)
+
 	// Metrics (atomic; readable without mu).
 	nPuts, nDeletes, nGets, nScans, nFlushes, nCompactions atomic.Uint64
 }
@@ -140,7 +142,7 @@ func Open(dir string, opts Options) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	d := &DB{dir: dir, opts: opts, man: man, mem: memtable.New(), tables: map[uint64]*sstable.Reader{}, meta: map[uint64]manifest.FileMeta{}}
+	d := &DB{dir: dir, opts: opts, man: man, mem: memtable.New(), snaps: map[uint64]int{}, tables: map[uint64]*sstable.Reader{}, meta: map[uint64]manifest.FileMeta{}}
 	switch {
 	case opts.BlockCacheSize == 0:
 		d.cache = sstable.NewCache(8 << 20)
@@ -429,7 +431,12 @@ func (d *DB) Get(key []byte) ([]byte, error) {
 	if d.closed {
 		return nil, ErrClosed
 	}
-	v, found, deleted := d.mem.Get(key, d.seq)
+	return d.getAtLocked(key, d.seq)
+}
+
+// getAtLocked reads key as of seqnum seq. d.mu must be held.
+func (d *DB) getAtLocked(key []byte, seq uint64) ([]byte, error) {
+	v, found, deleted := d.mem.Get(key, seq)
 	if found {
 		if deleted {
 			return nil, ErrNotFound
@@ -440,7 +447,7 @@ func (d *DB) Get(key []byte) ([]byte, error) {
 	// first, so the first hit is the newest version.
 	for l := 0; l < numLevels; l++ {
 		for _, n := range d.candidates(l, key) {
-			v, found, deleted, err := d.tables[n].Get(key, d.seq)
+			v, found, deleted, err := d.tables[n].Get(key, seq)
 			if err != nil {
 				return nil, err
 			}
@@ -537,6 +544,11 @@ func (d *DB) Scan(start, end []byte, fn func(key, value []byte) bool) error {
 	if d.closed {
 		return ErrClosed
 	}
+	return d.scanAtLocked(start, end, d.seq, fn)
+}
+
+// scanAtLocked scans as of seqnum seq. d.mu must be held.
+func (d *DB) scanAtLocked(start, end []byte, seq uint64, fn func(key, value []byte) bool) error {
 	srcs := []merge.Source{d.mem.NewIteratorFrom(start)}
 	for _, n := range d.allTables() {
 		it := d.tables[n].NewIterator()
@@ -545,7 +557,7 @@ func (d *DB) Scan(start, end []byte, fn func(key, value []byte) bool) error {
 		}
 		srcs = append(srcs, it)
 	}
-	u := merge.NewUser(merge.New(srcs...), d.seq, end)
+	u := merge.NewUser(merge.New(srcs...), seq, end)
 	for u.Next() {
 		if !fn(u.Key(), u.Value()) {
 			return nil

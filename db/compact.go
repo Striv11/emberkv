@@ -89,6 +89,7 @@ type compaction struct {
 	all    []uint64 // inputs plus overlapping tables of level+1
 	bottom bool
 	srcs   []merge.Source
+	snaps  []uint64 // live snapshot seqnums, ascending, captured at plan time
 }
 
 // pickLocked chooses the next compaction, or nil if every level is within
@@ -147,6 +148,7 @@ func (d *DB) planLocked(level int, inputs []uint64) *compaction {
 			c.bottom = false
 		}
 	}
+	c.snaps = d.snapshotSeqsLocked()
 	for _, n := range c.all {
 		c.srcs = append(c.srcs, d.tables[n].NewIterator())
 	}
@@ -183,7 +185,7 @@ func (d *DB) runLocked(c *compaction) error {
 // buildCompaction merges c's inputs into new tables at level+1. It touches
 // only immutable tables and the file-number allocator, so it may run without
 // d.mu. On error it removes any partial output. Only the newest version of
-// each key is kept, since reads are always at the latest sequence number. A
+// each key is kept, plus versions that live snapshots can still see. A
 // tombstone is dropped when no deeper level overlaps the compacted range.
 func (d *DB) buildCompaction(c *compaction, alloc func() uint64) ([]manifest.FileMeta, error) {
 	out := c.level + 1
@@ -217,18 +219,32 @@ func (d *DB) buildCompaction(c *compaction, alloc func() uint64) ([]manifest.Fil
 		return nil
 	}
 
+	// Versions of a key arrive newest first. Keep the newest, plus any older
+	// version that is the newest one visible to some snapshot (a snapshot
+	// seqnum sn with e.Seq <= sn < lastKept).
 	var lastKey []byte
+	var lastKept uint64
 	haveLast := false
 	for it.Next() {
 		e := it.Entry()
-		if haveLast && bytes.Equal(e.Key, lastKey) {
-			continue // older version of a key already handled
+		first := !haveLast || !bytes.Equal(e.Key, lastKey)
+		if first {
+			lastKey, haveLast = append(lastKey[:0], e.Key...), true
+			lastKept = e.Seq
+			// A bottom tombstone can go only if no snapshot predates it;
+			// otherwise older versions must stay visible beneath it.
+			if e.Kind == memtable.KindDelete && c.bottom && (len(c.snaps) == 0 || c.snaps[0] >= e.Seq) {
+				continue
+			}
+		} else {
+			if !snapshotNeeds(c.snaps, e.Seq, lastKept) {
+				continue
+			}
+			lastKept = e.Seq
 		}
-		lastKey, haveLast = append(lastKey[:0], e.Key...), true
-		if e.Kind == memtable.KindDelete && c.bottom {
-			continue
-		}
-		if w != nil && curBytes >= d.opts.TargetFileSize {
+		// Cut only at user-key boundaries: point reads probe one table per
+		// level, so all retained versions of a key must share a file.
+		if w != nil && first && curBytes >= d.opts.TargetFileSize {
 			if err := finish(); err != nil {
 				cleanup()
 				return nil, err
@@ -259,6 +275,13 @@ func (d *DB) buildCompaction(c *compaction, alloc func() uint64) ([]manifest.Fil
 		return nil, err
 	}
 	return outputs, nil
+}
+
+// snapshotNeeds reports whether some snapshot seqnum sn (snaps ascending)
+// satisfies seq <= sn < newer, i.e. a snapshot would read this version.
+func snapshotNeeds(snaps []uint64, seq, newer uint64) bool {
+	i := sort.Search(len(snaps), func(i int) bool { return snaps[i] >= seq })
+	return i < len(snaps) && snaps[i] < newer
 }
 
 // installCompactionLocked commits a built compaction. The version edit that
