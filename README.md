@@ -54,7 +54,7 @@ fillseq         100000 ops    648856 ops/s     1.54 us/op
 readrandom      100000 ops    230229 ops/s     4.34 us/op
 scan            100000 ops   5476118 ops/s     0.18 us/op
 ```
-Limits: `kill -9` tests process crashes, where the OS page cache survives; it does not simulate power loss or torn writes (the WAL tests cover truncation at every byte offset separately).
+Limits: `kill -9` tests process crashes, where the OS page cache survives. Power loss is covered separately by the in-memory filesystem below (`go test ./db -run PowerLoss`).
 
 ## Design decisions & trade-offs
 - **Single-file WAL with per-record CRC**: simple, and recovery is a linear scan. Segment rotation arrives with memtable flushes.
@@ -74,6 +74,7 @@ Limits: `kill -9` tests process crashes, where the OS page cache survives; it do
 - **Block cache**: one LRU cache (`Options.BlockCacheSize`, default 8 MiB, negative disables) is shared by every SSTable reader. It stores verified, parsed data blocks keyed by (reader, block), so a hit skips the pread, the CRC and the parse. Blocks are immutable, so they are shared without copying; a reader's blocks are dropped when its table is closed (e.g. after compaction). `DB.CacheStats()` exposes hits, misses, evictions and bytes.
 - **Metrics**: `DB.Stats()` returns operation counters (atomics, no lock on the hot path), flush/compaction counts and, under a read lock, per-level table counts and bytes plus block cache stats. The `metrics` package renders them in Prometheus text format and provides an `http.Handler`; `emberkv stats` prints or serves them. Counters are per process lifetime, as Prometheus expects.
 - **Snapshots**: `DB.NewSnapshot()` pins the current seqnum and offers `Get`/`Scan` as of that point, since every read path already takes a seqnum. Compaction receives the live snapshot seqnums at plan time and keeps, per key, the newest version plus the newest version visible to each snapshot; a bottom-level tombstone is dropped only if no snapshot predates it. Output files are cut only at user-key boundaries so all retained versions of a key share one table (point reads probe one table per level). Snapshots made during a build need no handling: they read at a seqnum above every input. Open snapshots cost disk space until `Release`.
+- **Power-loss simulation (`vfs`)**: all file access goes through a small `vfs.FS` interface (`Options.FS`; default is the OS). `vfs.MemFS` models durability: file bytes survive only up to the last `Sync`, and creates, renames and removes survive only after `SyncDir` of the directory. `Crash(rng)` returns the post-power-cut filesystem, optionally keeping a random prefix of each unsynced tail (torn writes). The test crashes a running DB (sync and background modes, while flushes and compactions are in flight) 40 times and checks every acknowledged write is recovered. Mutation check: dropping the directory sync after creating a WAL segment makes it fail, so `wal.Open` now syncs the directory when it creates a file.
 
 ## Roadmap
 See [PLAN.md](PLAN.md). Day-by-day progress is in [WORKLOG.md](WORKLOG.md).

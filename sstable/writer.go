@@ -21,8 +21,10 @@ import (
 	"fmt"
 	"hash/crc32"
 	"os"
+	"path/filepath"
 
 	"github.com/Striv11/emberkv/memtable"
+	"github.com/Striv11/emberkv/vfs"
 )
 
 const (
@@ -37,7 +39,8 @@ const (
 // crash never leaves a partial table at the final path.
 type Writer struct {
 	path, tmp string
-	f         *os.File
+	fs        vfs.FS
+	f         vfs.File
 	off       uint64
 	blk       blockBuilder
 	index     blockBuilder
@@ -50,13 +53,17 @@ type Writer struct {
 }
 
 // NewWriter creates a writer that will produce path.
-func NewWriter(path string) (*Writer, error) {
+func NewWriter(path string) (*Writer, error) { return NewWriterFS(nil, path) }
+
+// NewWriterFS is NewWriter on the given filesystem (nil means the real one).
+func NewWriterFS(fsys vfs.FS, path string) (*Writer, error) {
+	fsys = vfs.Or(fsys)
 	tmp := path + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	f, err := fsys.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
 	if err != nil {
 		return nil, err
 	}
-	return &Writer{path: path, tmp: tmp, f: f}, nil
+	return &Writer{fs: fsys, path: path, tmp: tmp, f: f}, nil
 }
 
 // Add appends one entry. Keys must be non-decreasing, and for equal keys the
@@ -153,10 +160,10 @@ func (w *Writer) Finish() error {
 		return w.fail(err)
 	}
 	w.f = nil
-	if err := os.Rename(w.tmp, w.path); err != nil {
+	if err := w.fs.Rename(w.tmp, w.path); err != nil {
 		return w.fail(err)
 	}
-	return syncDir(w.path)
+	return w.fs.SyncDir(filepath.Dir(w.path))
 }
 
 // Abort discards a partially written table.
@@ -166,5 +173,5 @@ func (w *Writer) Abort() error {
 	}
 	err := w.f.Close()
 	w.f = nil
-	return errors.Join(err, os.Remove(w.tmp))
+	return errors.Join(err, w.fs.Remove(w.tmp))
 }

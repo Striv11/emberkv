@@ -2,7 +2,6 @@ package db
 
 import (
 	"bytes"
-	"os"
 	"sort"
 
 	"github.com/Striv11/emberkv/manifest"
@@ -200,7 +199,7 @@ func (d *DB) buildCompaction(c *compaction, alloc func() uint64) ([]manifest.Fil
 			w.Abort()
 		}
 		for _, m := range outputs {
-			os.Remove(sstPath(d.dir, m.Num))
+			d.fs.Remove(sstPath(d.dir, m.Num))
 		}
 	}
 	finish := func() error {
@@ -212,7 +211,7 @@ func (d *DB) buildCompaction(c *compaction, alloc func() uint64) ([]manifest.Fil
 		if err != nil {
 			return err
 		}
-		if st, err := os.Stat(sstPath(d.dir, cur.Num)); err == nil {
+		if st, err := d.fs.Stat(sstPath(d.dir, cur.Num)); err == nil {
 			cur.Size = uint64(st.Size())
 		}
 		outputs = append(outputs, cur)
@@ -253,7 +252,7 @@ func (d *DB) buildCompaction(c *compaction, alloc func() uint64) ([]manifest.Fil
 		if w == nil {
 			num := alloc()
 			var err error
-			if w, err = sstable.NewWriter(sstPath(d.dir, num)); err != nil {
+			if w, err = sstable.NewWriterFS(d.fs, sstPath(d.dir, num)); err != nil {
 				cleanup()
 				return nil, err
 			}
@@ -297,7 +296,7 @@ func (d *DB) installCompactionLocked(c *compaction, outputs []manifest.FileMeta)
 			r.Close()
 		}
 		for _, m := range outputs {
-			os.Remove(sstPath(d.dir, m.Num))
+			d.fs.Remove(sstPath(d.dir, m.Num))
 		}
 	}
 	for _, m := range outputs {
@@ -337,7 +336,7 @@ func (d *DB) installCompactionLocked(c *compaction, outputs []manifest.FileMeta)
 		d.tables[n].Close()
 		delete(d.tables, n)
 		delete(d.meta, n)
-		os.Remove(sstPath(d.dir, n))
+		d.fs.Remove(sstPath(d.dir, n))
 	}
 	d.nCompactions.Add(1)
 	return nil
@@ -378,7 +377,7 @@ func (d *DB) compactLoop() {
 		d.mu.Lock()
 		if err == nil && d.closed {
 			for _, m := range outputs {
-				os.Remove(sstPath(d.dir, m.Num))
+				d.fs.Remove(sstPath(d.dir, m.Num))
 			}
 		} else if err == nil {
 			err = d.installCompactionLocked(c, outputs)

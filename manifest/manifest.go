@@ -7,11 +7,12 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"os"
+	"io/fs"
 	"path/filepath"
 	"sort"
 	"sync"
 
+	"github.com/Striv11/emberkv/vfs"
 	"github.com/Striv11/emberkv/wal"
 )
 
@@ -88,10 +89,14 @@ type Manifest struct {
 }
 
 // Open opens or creates the manifest at path and replays it.
-func Open(path string) (*Manifest, error) {
+func Open(path string) (*Manifest, error) { return OpenFS(nil, path) }
+
+// OpenFS is Open on the given filesystem (nil means the real one).
+func OpenFS(fsys vfs.FS, path string) (*Manifest, error) {
+	fsys = vfs.Or(fsys)
 	st := State{Files: map[uint64]FileMeta{}}
 	edits := 0
-	log, _, err := wal.Open(path, wal.Options{SyncOnAppend: true}, func(p []byte) error {
+	log, _, err := wal.Open(path, wal.Options{SyncOnAppend: true, FS: fsys}, func(p []byte) error {
 		e, err := decode(p)
 		if err != nil {
 			return err
@@ -105,7 +110,7 @@ func Open(path string) (*Manifest, error) {
 	}
 	m := &Manifest{log: log, state: st}
 	if edits > snapshotThreshold {
-		if err := m.rewrite(path); err != nil {
+		if err := m.rewrite(fsys, path); err != nil {
 			log.Close()
 			return nil, err
 		}
@@ -114,12 +119,12 @@ func Open(path string) (*Manifest, error) {
 }
 
 // rewrite replaces the manifest with one snapshot edit, atomically via rename.
-func (m *Manifest) rewrite(path string) error {
+func (m *Manifest) rewrite(fsys vfs.FS, path string) error {
 	tmp := path + ".tmp"
-	if err := os.Remove(tmp); err != nil && !os.IsNotExist(err) {
+	if err := fsys.Remove(tmp); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
-	nl, _, err := wal.Open(tmp, wal.Options{SyncOnAppend: true}, nil)
+	nl, _, err := wal.Open(tmp, wal.Options{SyncOnAppend: true, FS: fsys}, nil)
 	if err != nil {
 		return err
 	}
@@ -131,24 +136,15 @@ func (m *Manifest) rewrite(path string) error {
 	if err := nl.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	if err := fsys.Rename(tmp, path); err != nil {
 		return err
 	}
-	if err := syncDir(path); err != nil {
+	if err := fsys.SyncDir(filepath.Dir(path)); err != nil {
 		return err
 	}
 	m.log.Close()
-	m.log, _, err = wal.Open(path, wal.Options{SyncOnAppend: true}, nil)
+	m.log, _, err = wal.Open(path, wal.Options{SyncOnAppend: true, FS: fsys}, nil)
 	return err
-}
-
-func syncDir(path string) error {
-	d, err := os.Open(filepath.Dir(path))
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	return d.Sync()
 }
 
 // State returns a copy of the current version.

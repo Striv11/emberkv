@@ -5,22 +5,12 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
-	"os"
-	"path/filepath"
 	"sort"
 	"sync/atomic"
 
 	"github.com/Striv11/emberkv/memtable"
+	"github.com/Striv11/emberkv/vfs"
 )
-
-func syncDir(path string) error {
-	d, err := os.Open(filepath.Dir(path))
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	return d.Sync()
-}
 
 type indexEntry struct {
 	lastKey     []byte
@@ -30,7 +20,7 @@ type indexEntry struct {
 // Reader serves lookups and iteration over one SSTable. It is safe for
 // concurrent use.
 type Reader struct {
-	f     *os.File
+	f     vfs.File
 	index []indexEntry
 	bloom *bloom
 	count uint64
@@ -47,8 +37,11 @@ func (r *Reader) SetCache(c *Cache) { r.cache = c }
 
 // Open opens and validates a table: footer, index and bloom filter are
 // checksummed and parsed eagerly; data blocks are verified when read.
-func Open(path string) (*Reader, error) {
-	f, err := os.Open(path)
+func Open(path string) (*Reader, error) { return OpenFS(nil, path) }
+
+// OpenFS is Open on the given filesystem (nil means the real one).
+func OpenFS(fsys vfs.FS, path string) (*Reader, error) {
+	f, err := vfs.Or(fsys).Open(path)
 	if err != nil {
 		return nil, err
 	}
@@ -60,7 +53,7 @@ func Open(path string) (*Reader, error) {
 	return r, nil
 }
 
-func newReader(f *os.File) (*Reader, error) {
+func newReader(f vfs.File) (*Reader, error) {
 	st, err := f.Stat()
 	if err != nil {
 		return nil, err

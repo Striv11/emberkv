@@ -9,7 +9,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -21,6 +20,7 @@ import (
 	"github.com/Striv11/emberkv/memtable"
 	"github.com/Striv11/emberkv/merge"
 	"github.com/Striv11/emberkv/sstable"
+	"github.com/Striv11/emberkv/vfs"
 	"github.com/Striv11/emberkv/wal"
 )
 
@@ -61,12 +61,16 @@ type Options struct {
 	// BlockCacheSize is the capacity in bytes of the shared LRU cache of
 	// SSTable data blocks. Zero means 8 MiB; a negative value disables it.
 	BlockCacheSize int64
+	// FS is the filesystem; nil means the real one. Tests use vfs.MemFS to
+	// simulate power loss.
+	FS vfs.FS
 }
 
 // DB is a durable key-value store. It is safe for concurrent use.
 type DB struct {
 	dir  string
 	opts Options
+	fs   vfs.FS
 
 	mu     sync.RWMutex // guards everything below; serializes writers and flushes
 	man    *manifest.Manifest
@@ -113,7 +117,7 @@ func sstPath(dir string, num uint64) string {
 
 // openTable opens table num and attaches the block cache.
 func (d *DB) openTable(num uint64) (*sstable.Reader, error) {
-	r, err := sstable.Open(sstPath(d.dir, num))
+	r, err := sstable.OpenFS(d.fs, sstPath(d.dir, num))
 	if err == nil {
 		r.SetCache(d.cache)
 	}
@@ -130,7 +134,7 @@ func (d *DB) CacheStats() sstable.CacheStats {
 
 // Open opens or creates a database in dir.
 func Open(dir string, opts Options) (*DB, error) {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := vfs.Or(opts.FS).MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
 	if opts.MemtableSize <= 0 {
@@ -145,11 +149,11 @@ func Open(dir string, opts Options) (*DB, error) {
 	if opts.TargetFileSize <= 0 {
 		opts.TargetFileSize = 2 << 20
 	}
-	man, err := manifest.Open(filepath.Join(dir, manifestName))
+	man, err := manifest.OpenFS(opts.FS, filepath.Join(dir, manifestName))
 	if err != nil {
 		return nil, err
 	}
-	d := &DB{dir: dir, opts: opts, man: man, mem: memtable.New(), snaps: map[uint64]int{}, tables: map[uint64]*sstable.Reader{}, meta: map[uint64]manifest.FileMeta{}}
+	d := &DB{dir: dir, opts: opts, fs: vfs.Or(opts.FS), man: man, mem: memtable.New(), snaps: map[uint64]int{}, tables: map[uint64]*sstable.Reader{}, meta: map[uint64]manifest.FileMeta{}}
 	switch {
 	case opts.BlockCacheSize == 0:
 		d.cache = sstable.NewCache(8 << 20)
@@ -213,26 +217,25 @@ func (d *DB) recover() error {
 	for l := 1; l < numLevels; l++ {
 		d.sortLevel(l)
 	}
-	ents, err := os.ReadDir(d.dir)
+	ents, err := d.fs.ReadDir(d.dir)
 	if err != nil {
 		return err
 	}
 	var segs []uint64
-	for _, e := range ents {
-		name := e.Name()
+	for _, name := range ents {
 		switch {
 		case strings.HasSuffix(name, ".tmp"):
-			os.Remove(filepath.Join(d.dir, name))
+			d.fs.Remove(filepath.Join(d.dir, name))
 		case strings.HasSuffix(name, ".sst"):
 			if n, ok := parseNum(name, ".sst"); ok {
 				if _, live := st.Files[n]; !live {
-					os.Remove(filepath.Join(d.dir, name))
+					d.fs.Remove(filepath.Join(d.dir, name))
 				}
 			}
 		case strings.HasSuffix(name, ".log"):
 			if n, ok := parseNum(name, ".log"); ok {
 				if n < d.logNum {
-					os.Remove(filepath.Join(d.dir, name)) // covered by a flushed table
+					d.fs.Remove(filepath.Join(d.dir, name)) // covered by a flushed table
 				} else {
 					segs = append(segs, n)
 				}
@@ -252,7 +255,7 @@ func (d *DB) recover() error {
 		}
 		return nil
 	}
-	wopts := wal.Options{SyncOnAppend: !d.opts.NoSync}
+	wopts := wal.Options{SyncOnAppend: !d.opts.NoSync, FS: d.fs}
 	// Replay every uncovered segment in order. The last one stays open for
 	// appends; earlier ones (left by a crash mid-flush) are replayed and
 	// closed, and are deleted by the next flush advancing LogNum.
@@ -376,14 +379,14 @@ func (d *DB) rotateLocked() error {
 		return err
 	}
 	num := d.next
-	newLog, _, err := wal.Open(walPath(d.dir, num), wal.Options{SyncOnAppend: !d.opts.NoSync}, nil)
+	newLog, _, err := wal.Open(walPath(d.dir, num), wal.Options{SyncOnAppend: !d.opts.NoSync, FS: d.fs}, nil)
 	if err != nil {
 		return err
 	}
 	d.next++
 	if err := d.log.Close(); err != nil {
 		newLog.Close()
-		os.Remove(walPath(d.dir, num))
+		d.fs.Remove(walPath(d.dir, num))
 		d.next--
 		return err
 	}
@@ -424,7 +427,7 @@ func (d *DB) flushLoop() {
 		switch {
 		case err == nil && d.closed:
 			r.Close()
-			os.Remove(sstPath(d.dir, num))
+			d.fs.Remove(sstPath(d.dir, num))
 		case err == nil:
 			err = d.man.Apply(manifest.Edit{
 				LogNum: d.logNum, NextFile: d.next, LastSeq: immSeq,
@@ -432,7 +435,7 @@ func (d *DB) flushLoop() {
 			})
 			if err != nil {
 				r.Close()
-				os.Remove(sstPath(d.dir, num))
+				d.fs.Remove(sstPath(d.dir, num))
 				break
 			}
 			d.tables[num] = r
@@ -440,7 +443,7 @@ func (d *DB) flushLoop() {
 			d.levels[0] = append([]uint64{num}, d.levels[0]...)
 			d.imm = nil
 			d.nFlushes.Add(1)
-			os.Remove(walPath(d.dir, immLog))
+			d.fs.Remove(walPath(d.dir, immLog))
 			d.kickCompaction()
 		}
 		if err != nil && d.bgErr == nil {
@@ -470,14 +473,14 @@ func (d *DB) flushLocked() error {
 		return err
 	}
 	newLogNum, tableNum := d.next, d.next+1
-	newLog, _, err := wal.Open(walPath(d.dir, newLogNum), wal.Options{SyncOnAppend: !d.opts.NoSync}, nil)
+	newLog, _, err := wal.Open(walPath(d.dir, newLogNum), wal.Options{SyncOnAppend: !d.opts.NoSync, FS: d.fs}, nil)
 	if err != nil {
 		return err
 	}
 	meta, err := d.writeTable(d.mem, tableNum)
 	if err != nil {
 		newLog.Close()
-		os.Remove(walPath(d.dir, newLogNum))
+		d.fs.Remove(walPath(d.dir, newLogNum))
 		return err
 	}
 	r, err := d.openTable(tableNum)
@@ -493,8 +496,8 @@ func (d *DB) flushLocked() error {
 		// Version not committed: the old segment stays authoritative.
 		r.Close()
 		newLog.Close()
-		os.Remove(sstPath(d.dir, tableNum))
-		os.Remove(walPath(d.dir, newLogNum))
+		d.fs.Remove(sstPath(d.dir, tableNum))
+		d.fs.Remove(walPath(d.dir, newLogNum))
 		return err
 	}
 	oldLog, oldNum := d.log, d.logNum
@@ -505,7 +508,7 @@ func (d *DB) flushLocked() error {
 	d.mem = memtable.New()
 	d.nFlushes.Add(1)
 	oldLog.Close()
-	os.Remove(walPath(d.dir, oldNum))
+	d.fs.Remove(walPath(d.dir, oldNum))
 	if d.opts.Background {
 		d.kickCompaction()
 		return nil
@@ -523,7 +526,7 @@ func (d *DB) kickCompaction() {
 
 func (d *DB) writeTable(mem *memtable.Table, num uint64) (manifest.FileMeta, error) {
 	meta := manifest.FileMeta{Num: num}
-	w, err := sstable.NewWriter(sstPath(d.dir, num))
+	w, err := sstable.NewWriterFS(d.fs, sstPath(d.dir, num))
 	if err != nil {
 		return meta, err
 	}
@@ -542,7 +545,7 @@ func (d *DB) writeTable(mem *memtable.Table, num uint64) (manifest.FileMeta, err
 	if err := w.Finish(); err != nil {
 		return meta, err
 	}
-	if st, err := os.Stat(sstPath(d.dir, num)); err == nil {
+	if st, err := d.fs.Stat(sstPath(d.dir, num)); err == nil {
 		meta.Size = uint64(st.Size())
 	}
 	return meta, nil

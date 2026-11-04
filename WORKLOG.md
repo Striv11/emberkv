@@ -73,3 +73,9 @@ Newest entries at the bottom. Each entry records what actually changed, what was
 **Tests:** reads see a frozen memtable; manual flush plus reopen leaves one WAL segment; 15 close-mid-flush rounds lose nothing and leave no `.tmp`; a 15k-op model check with reopens and concurrent readers under `-race`. 60-iteration crashtest (which uses the background path): 34.7k acked ops, 0 lost.
 **Learned:** the stall has to happen before the append (while holding the lock via cond wait), not after, or the active memtable grows unbounded behind a slow flush; and the manifest's max-merge semantics for LogNum/NextFile make the out-of-lock install safe.
 **Next:** power-loss fault-injecting FS (drop unsynced bytes), then README benchmark refresh.
+
+## 2026-11-04 (later): power-loss simulation
+**Changed:** New `vfs` package: `FS`/`File` interfaces, `OS` implementation and `MemFS`, an in-memory filesystem where file bytes are durable only after `Sync` and names only after `SyncDir`. `Crash(rng)` yields the post-power-cut state, optionally keeping random unsynced tail bytes. wal, manifest, sstable and db take an optional FS (`Options.FS`, `OpenFS`, `NewWriterFS`); defaults are unchanged. `wal.Open` now fsyncs the directory when it creates a file.
+**Tests:** MemFS unit tests (unsynced bytes, unsynced names/renames/removes, torn tails are prefixes); `TestPowerLossKeepsAcknowledgedWrites` does 40 crash/reopen rounds in sync and background modes and compares to a model. Mutation check: removing the new-file directory sync in the WAL makes it fail with lost keys.
+**Learned:** the engine was missing a directory fsync after creating WAL segments, which `kill -9` testing can never reveal.
+**Next:** refresh README benchmark numbers; consider injecting write/sync errors in MemFS.

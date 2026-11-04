@@ -22,7 +22,10 @@ import (
 	"hash/crc32"
 	"io"
 	"os"
+	"path/filepath"
 	"sync"
+
+	"github.com/Striv11/emberkv/vfs"
 )
 
 const headerSize = 8
@@ -44,12 +47,14 @@ type Options struct {
 	// SyncOnAppend fsyncs after every Append. Without it, callers decide
 	// when to call Sync (group commit).
 	SyncOnAppend bool
+	// FS is the filesystem; nil means the real one.
+	FS vfs.FS
 }
 
 // Log is a single-file write-ahead log. It is safe for concurrent use.
 type Log struct {
 	mu     sync.Mutex
-	f      *os.File
+	f      vfs.File
 	w      *bufio.Writer
 	opts   Options
 	size   int64
@@ -67,9 +72,20 @@ type RecoveryInfo struct {
 // valid record, in order, then truncates any torn tail so new appends follow
 // the last good record. The payload passed to replay must not be retained.
 func Open(path string, opts Options, replay func(payload []byte) error) (*Log, RecoveryInfo, error) {
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o644)
+	fsys := vfs.Or(opts.FS)
+	_, statErr := fsys.Stat(path)
+	created := statErr != nil
+	f, err := fsys.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
 		return nil, RecoveryInfo{}, err
+	}
+	if created {
+		// A new file's name is durable only after its directory is synced;
+		// without this a power cut could lose a segment holding acked data.
+		if err := fsys.SyncDir(filepath.Dir(path)); err != nil {
+			f.Close()
+			return nil, RecoveryInfo{}, err
+		}
 	}
 	info, err := scan(f, replay)
 	if err != nil {
@@ -94,7 +110,7 @@ func Open(path string, opts Options, replay func(payload []byte) error) (*Log, R
 	return l, info, nil
 }
 
-func scan(f *os.File, replay func([]byte) error) (RecoveryInfo, error) {
+func scan(f vfs.File, replay func([]byte) error) (RecoveryInfo, error) {
 	st, err := f.Stat()
 	if err != nil {
 		return RecoveryInfo{}, err
