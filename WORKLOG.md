@@ -67,3 +67,9 @@ Newest entries at the bottom. Each entry records what actually changed, what was
 **Tests:** isolation against later puts/deletes; two model-checked runs (sync and background, 6000 ops, snapshots taken and released mid-stream) comparing every snapshot's Scan and Get to its model after compaction; reclamation still works with no snapshots; closed-DB behaviour. Pass under `-race`.
 **Learned:** the model check's Scan passed while point Get failed: retained versions of one key had been split across two output files and Get probes only one table per level. Cutting at key boundaries fixed it.
 **Next:** background flush, power-loss fault-injecting FS.
+
+## 2026-11-04: background flush
+**Changed:** With `Options.Background`, a full memtable is now rotated instead of flushed inline: the WAL segment is synced and closed, a new segment and empty memtable take over, and the old memtable becomes the frozen `imm`. A `flushLoop` goroutine writes it to L0 without the DB lock and commits with one MANIFEST edit (`LogNum` = active segment), then deletes the frozen segment. `Get`, `Scan` and `Stats` include `imm`; `Flush()` and `WaitCompaction()` wait for it. Writers stall only if the active memtable fills while an `imm` is still being flushed. `writeTable` now takes the memtable to write.
+**Tests:** reads see a frozen memtable; manual flush plus reopen leaves one WAL segment; 15 close-mid-flush rounds lose nothing and leave no `.tmp`; a 15k-op model check with reopens and concurrent readers under `-race`. 60-iteration crashtest (which uses the background path): 34.7k acked ops, 0 lost.
+**Learned:** the stall has to happen before the append (while holding the lock via cond wait), not after, or the active memtable grows unbounded behind a slow flush; and the manifest's max-merge semantics for LogNum/NextFile make the out-of-lock install safe.
+**Next:** power-loss fault-injecting FS (drop unsynced bytes), then README benchmark refresh.

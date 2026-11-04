@@ -29,6 +29,9 @@ func (d *DB) Stats() Stats {
 		MemtableBytes: int64(d.mem.Size()),
 		LastSeq:       d.seq,
 	}
+	if d.imm != nil {
+		s.MemtableBytes += int64(d.imm.Size())
+	}
 	for l := range s.Levels {
 		s.Levels[l].Tables = len(d.levels[l])
 		for _, n := range d.levels[l] {

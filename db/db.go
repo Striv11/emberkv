@@ -73,9 +73,15 @@ type DB struct {
 	log    *wal.Log
 	logNum uint64
 	mem    *memtable.Table
-	cache  *sstable.Cache // nil when disabled
-	tables map[uint64]*sstable.Reader
-	meta   map[uint64]manifest.FileMeta
+	// imm is the frozen memtable being flushed by the background flusher
+	// (nil when none). Its WAL segment is immLogNum; it is deleted once the
+	// flush commits.
+	imm       *memtable.Table
+	immLogNum uint64
+	immSeq    uint64
+	cache     *sstable.Cache // nil when disabled
+	tables    map[uint64]*sstable.Reader
+	meta      map[uint64]manifest.FileMeta
 	// levels[0] holds L0 file numbers newest first (ranges may overlap).
 	// levels[i>0] hold non-overlapping files sorted by smallest key.
 	levels [numLevels][]uint64
@@ -86,6 +92,7 @@ type DB struct {
 	// Background compaction state (guarded by mu).
 	cond       *sync.Cond
 	kick       chan struct{}
+	flushKick  chan struct{}
 	wg         sync.WaitGroup
 	compacting bool
 	bgErr      error
@@ -158,6 +165,9 @@ func Open(dir string, opts Options) (*DB, error) {
 		d.kick = make(chan struct{}, 1)
 		d.wg.Add(1)
 		go d.compactLoop()
+		d.flushKick = make(chan struct{}, 1)
+		d.wg.Add(1)
+		go d.flushLoop()
 		d.kickCompaction() // recovery may have left work behind
 	} else {
 		d.opts.Background = false
@@ -290,8 +300,10 @@ func (d *DB) write(kind memtable.Kind, key, value []byte) error {
 	if d.closed {
 		return ErrClosed
 	}
-	for d.opts.Background && !d.closed && d.bgErr == nil && len(d.levels[0]) >= 3*d.opts.L0Trigger {
-		d.cond.Wait() // L0 stall: let the compactor catch up
+	for d.opts.Background && !d.closed && d.bgErr == nil &&
+		(len(d.levels[0]) >= 3*d.opts.L0Trigger ||
+			(d.imm != nil && d.mem.Size() >= d.opts.MemtableSize)) {
+		d.cond.Wait() // stall: let the compactor / flusher catch up
 	}
 	if d.closed {
 		return ErrClosed
@@ -311,19 +323,132 @@ func (d *DB) write(kind memtable.Kind, key, value []byte) error {
 	d.seq = seq
 	d.mem.Add(seq, kind, key, value)
 	if d.mem.Size() >= d.opts.MemtableSize {
+		if d.opts.Background {
+			if d.imm == nil {
+				return d.rotateLocked()
+			}
+			return nil // the next write stalls until the flusher is done
+		}
 		return d.flushLocked()
 	}
 	return nil
 }
 
-// Flush writes the current memtable to an L0 SSTable immediately.
+// Flush writes the current memtable to an L0 SSTable and returns once it is
+// committed.
 func (d *DB) Flush() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.closed {
 		return ErrClosed
 	}
-	return d.flushLocked()
+	if !d.opts.Background {
+		return d.flushLocked()
+	}
+	if err := d.waitImmLocked(); err != nil {
+		return err
+	}
+	if err := d.rotateLocked(); err != nil {
+		return err
+	}
+	return d.waitImmLocked()
+}
+
+// waitImmLocked blocks until no frozen memtable is pending.
+func (d *DB) waitImmLocked() error {
+	for d.imm != nil && !d.closed && d.bgErr == nil {
+		d.cond.Wait()
+	}
+	if d.closed {
+		return ErrClosed
+	}
+	return d.bgErr
+}
+
+// rotateLocked freezes the memtable and switches writes to a fresh memtable
+// and WAL segment; the flusher then persists the frozen one. d.imm must be
+// nil and d.mu held for writing.
+func (d *DB) rotateLocked() error {
+	if d.mem.Len() == 0 {
+		return nil
+	}
+	if err := d.log.Sync(); err != nil {
+		return err
+	}
+	num := d.next
+	newLog, _, err := wal.Open(walPath(d.dir, num), wal.Options{SyncOnAppend: !d.opts.NoSync}, nil)
+	if err != nil {
+		return err
+	}
+	d.next++
+	if err := d.log.Close(); err != nil {
+		newLog.Close()
+		os.Remove(walPath(d.dir, num))
+		d.next--
+		return err
+	}
+	d.imm, d.immLogNum, d.immSeq = d.mem, d.logNum, d.seq
+	d.log, d.logNum = newLog, num
+	d.mem = memtable.New()
+	select {
+	case d.flushKick <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+// flushLoop persists frozen memtables without holding d.mu while writing.
+// The commit point is the same single MANIFEST edit as a synchronous flush;
+// recovery replays every WAL segment at or above LogNum, so a crash before
+// the edit replays the frozen memtable's segment and drops the orphan table.
+func (d *DB) flushLoop() {
+	defer d.wg.Done()
+	for range d.flushKick {
+		d.mu.Lock()
+		if d.imm == nil || d.closed || d.bgErr != nil {
+			d.mu.Unlock()
+			continue
+		}
+		imm, immLog, immSeq := d.imm, d.immLogNum, d.immSeq
+		num := d.next
+		d.next++
+		d.mu.Unlock()
+
+		meta, err := d.writeTable(imm, num)
+		var r *sstable.Reader
+		if err == nil {
+			r, err = d.openTable(num)
+		}
+
+		d.mu.Lock()
+		switch {
+		case err == nil && d.closed:
+			r.Close()
+			os.Remove(sstPath(d.dir, num))
+		case err == nil:
+			err = d.man.Apply(manifest.Edit{
+				LogNum: d.logNum, NextFile: d.next, LastSeq: immSeq,
+				Added: []manifest.FileMeta{meta},
+			})
+			if err != nil {
+				r.Close()
+				os.Remove(sstPath(d.dir, num))
+				break
+			}
+			d.tables[num] = r
+			d.meta[num] = meta
+			d.levels[0] = append([]uint64{num}, d.levels[0]...)
+			d.imm = nil
+			d.nFlushes.Add(1)
+			os.Remove(walPath(d.dir, immLog))
+			d.kickCompaction()
+		}
+		if err != nil && d.bgErr == nil {
+			d.bgErr = err
+		}
+		d.cond.Broadcast()
+		d.mu.Unlock()
+	}
 }
 
 // flushLocked runs the flush protocol; d.mu must be held for writing.
@@ -335,8 +460,8 @@ func (d *DB) Flush() error {
 //     and deletes the orphan table; after it, the old segment is obsolete.
 //  4. Swap in an empty memtable, close and delete the old segment.
 //
-// Writers and readers are blocked for the duration; background flushing is a
-// later optimization.
+// Writers and readers are blocked for the duration; with Options.Background
+// flushing is done by flushLoop instead and this path is only used otherwise.
 func (d *DB) flushLocked() error {
 	if d.mem.Len() == 0 {
 		return nil
@@ -349,7 +474,7 @@ func (d *DB) flushLocked() error {
 	if err != nil {
 		return err
 	}
-	meta, err := d.writeTable(tableNum)
+	meta, err := d.writeTable(d.mem, tableNum)
 	if err != nil {
 		newLog.Close()
 		os.Remove(walPath(d.dir, newLogNum))
@@ -396,13 +521,13 @@ func (d *DB) kickCompaction() {
 	}
 }
 
-func (d *DB) writeTable(num uint64) (manifest.FileMeta, error) {
+func (d *DB) writeTable(mem *memtable.Table, num uint64) (manifest.FileMeta, error) {
 	meta := manifest.FileMeta{Num: num}
 	w, err := sstable.NewWriter(sstPath(d.dir, num))
 	if err != nil {
 		return meta, err
 	}
-	it := d.mem.NewIterator()
+	it := mem.NewIterator()
 	for it.Next() {
 		e := it.Entry()
 		if meta.Smallest == nil {
@@ -442,6 +567,14 @@ func (d *DB) getAtLocked(key []byte, seq uint64) ([]byte, error) {
 			return nil, ErrNotFound
 		}
 		return v, nil
+	}
+	if d.imm != nil {
+		if v, found, deleted := d.imm.Get(key, seq); found {
+			if deleted {
+				return nil, ErrNotFound
+			}
+			return v, nil
+		}
 	}
 	// Shallower levels hold newer versions, and within L0 newer tables come
 	// first, so the first hit is the newest version.
@@ -484,6 +617,7 @@ func (d *DB) Close() error {
 	d.cond.Broadcast()
 	if d.kick != nil {
 		close(d.kick)
+		close(d.flushKick)
 		d.mu.Unlock()
 		d.wg.Wait() // the compactor sees closed and discards unfinished output
 		d.mu.Lock()
@@ -550,6 +684,9 @@ func (d *DB) Scan(start, end []byte, fn func(key, value []byte) bool) error {
 // scanAtLocked scans as of seqnum seq. d.mu must be held.
 func (d *DB) scanAtLocked(start, end []byte, seq uint64, fn func(key, value []byte) bool) error {
 	srcs := []merge.Source{d.mem.NewIteratorFrom(start)}
+	if d.imm != nil {
+		srcs = append(srcs, d.imm.NewIteratorFrom(start))
+	}
 	for _, n := range d.allTables() {
 		it := d.tables[n].NewIterator()
 		if start != nil {

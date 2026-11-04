@@ -401,7 +401,7 @@ func (d *DB) WaitCompaction() error {
 	if !d.opts.Background {
 		return nil
 	}
-	for !d.closed && d.bgErr == nil && (d.compacting || d.pickLocked() != nil) {
+	for !d.closed && d.bgErr == nil && (d.imm != nil || d.compacting || d.pickLocked() != nil) {
 		d.cond.Wait()
 	}
 	return d.bgErr

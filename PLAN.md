@@ -14,7 +14,7 @@ Seven-day arc. Every milestone has acceptance criteria that can be checked by a 
 
 ## Stretch
 - Power-loss simulation: a fault-injecting filesystem layer that drops unsynced bytes
-- Move *flush* to a background goroutine too (compaction is done)
+- [x] Move *flush* to a background goroutine too (compaction is done)
 - [x] Block cache (LRU) and its metrics
 - [x] Snapshots / MVCC reads at a seqnum
 - [x] Prometheus-style stats endpoint

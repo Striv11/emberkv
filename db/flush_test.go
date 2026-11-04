@@ -114,7 +114,7 @@ func TestCrashBeforeManifestCommit(t *testing.T) {
 	d.Sync()
 	// Simulate the crashed flush's leftovers: orphan table, empty next WAL, tmp file.
 	orphan := sstPath(dir, d.next+1)
-	if _, err := d.writeTable(d.next + 1); err != nil {
+	if _, err := d.writeTable(d.mem, d.next+1); err != nil {
 		t.Fatal(err)
 	}
 	newWAL := walPath(dir, d.next)
