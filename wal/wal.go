@@ -59,6 +59,7 @@ type Log struct {
 	opts   Options
 	size   int64
 	closed bool
+	failed error // sticky: first write or sync error
 }
 
 // RecoveryInfo describes what Open found on disk.
@@ -171,11 +172,18 @@ func (l *Log) Append(payload []byte) error {
 	if l.closed {
 		return ErrClosed
 	}
+	if l.failed != nil {
+		return l.failed
+	}
+	// After a failed write or sync the file may hold a torn record, and the
+	// state of the page cache is unknown, so appending more would put valid
+	// records behind garbage that replay treats as the end of the log. Fail
+	// permanently instead; reopening truncates the tail.
 	if _, err := l.w.Write(hdr[:]); err != nil {
-		return err
+		return l.fail(err)
 	}
 	if _, err := l.w.Write(payload); err != nil {
-		return err
+		return l.fail(err)
 	}
 	l.size += headerSize + int64(len(payload))
 	if l.opts.SyncOnAppend {
@@ -194,11 +202,22 @@ func (l *Log) Sync() error {
 	return l.syncLocked()
 }
 
+func (l *Log) fail(err error) error {
+	l.failed = fmt.Errorf("wal: log failed, reopen to recover: %w", err)
+	return l.failed
+}
+
 func (l *Log) syncLocked() error {
-	if err := l.w.Flush(); err != nil {
-		return err
+	if l.failed != nil {
+		return l.failed
 	}
-	return l.f.Sync()
+	if err := l.w.Flush(); err != nil {
+		return l.fail(err)
+	}
+	if err := l.f.Sync(); err != nil {
+		return l.fail(err)
+	}
+	return nil
 }
 
 // Size returns the logical size of the log in bytes, including buffered data.

@@ -2,12 +2,15 @@ package wal
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"math/rand"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
+
+	"github.com/Striv11/emberkv/vfs"
 )
 
 func openT(t *testing.T, path string) (*Log, [][]byte, RecoveryInfo) {
@@ -192,5 +195,32 @@ func BenchmarkAppend(b *testing.B) {
 	b.SetBytes(int64(len(p)))
 	for i := 0; i < b.N; i++ {
 		l.Append(p)
+	}
+}
+
+func TestFailedSyncMakesLogPermanentlyFailed(t *testing.T) {
+	fsys := vfs.NewMem()
+	l, _, err := Open("/w/log", Options{FS: fsys, SyncOnAppend: true}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Append([]byte("ok")); err != nil {
+		t.Fatal(err)
+	}
+	fsys.SetFault(func(op, _ string) error {
+		if op == "sync" {
+			return errors.New("boom")
+		}
+		return nil
+	})
+	if err := l.Append([]byte("bad")); err == nil {
+		t.Fatal("expected sync error")
+	}
+	fsys.SetFault(nil)
+	if err := l.Append([]byte("later")); err == nil {
+		t.Fatal("append after failure must fail")
+	}
+	if err := l.Sync(); err == nil {
+		t.Fatal("sync after failure must fail")
 	}
 }

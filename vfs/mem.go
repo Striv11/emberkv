@@ -28,6 +28,17 @@ type MemFS struct {
 	mu      sync.Mutex
 	live    map[string]*node // current namespace
 	durable map[string]*node // namespace as of the last SyncDir of each dir
+	fault   func(op, name string) error
+}
+
+// SetFault installs an error injector. It is called before every Write, Sync
+// and SyncDir with the operation name ("write", "sync", "syncdir") and the
+// path; a non-nil result is returned to the caller and the operation has no
+// effect, except that a failed "write" first stores half of the data (a torn write), as a real failing disk may. nil removes it.
+func (m *MemFS) SetFault(f func(op, name string) error) {
+	m.mu.Lock()
+	m.fault = f
+	m.mu.Unlock()
 }
 
 // NewMem returns an empty MemFS.
@@ -137,6 +148,11 @@ func (m *MemFS) SyncDir(dir string) error {
 	dir = filepath.Clean(dir)
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.fault != nil {
+		if err := m.fault("syncdir", dir); err != nil {
+			return err
+		}
+	}
 	for p := range m.durable {
 		if filepath.Dir(p) == dir {
 			delete(m.durable, p)
@@ -189,13 +205,24 @@ func (f *memFile) Write(p []byte) (int, error) {
 	if !f.canWrite {
 		return 0, &fs.PathError{Op: "write", Path: f.name, Err: fs.ErrPermission}
 	}
+	if f.fs.fault != nil {
+		if err := f.fs.fault("write", f.name); err != nil {
+			p = p[:len(p)/2] // torn write: half the bytes land
+			f.store(p)
+			return len(p), err
+		}
+	}
+	f.store(p)
+	return len(p), nil
+}
+
+func (f *memFile) store(p []byte) {
 	end := f.off + int64(len(p))
 	for int64(len(f.n.data)) < end {
 		f.n.data = append(f.n.data, 0)
 	}
 	copy(f.n.data[f.off:], p)
 	f.off = end
-	return len(p), nil
 }
 
 func (f *memFile) Seek(off int64, whence int) (int64, error) {
@@ -215,6 +242,11 @@ func (f *memFile) Seek(off int64, whence int) (int64, error) {
 func (f *memFile) Sync() error {
 	f.fs.mu.Lock()
 	defer f.fs.mu.Unlock()
+	if f.fs.fault != nil {
+		if err := f.fs.fault("sync", f.name); err != nil {
+			return err
+		}
+	}
 	f.n.synced = len(f.n.data)
 	return nil
 }

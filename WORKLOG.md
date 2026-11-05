@@ -79,3 +79,9 @@ Newest entries at the bottom. Each entry records what actually changed, what was
 **Tests:** MemFS unit tests (unsynced bytes, unsynced names/renames/removes, torn tails are prefixes); `TestPowerLossKeepsAcknowledgedWrites` does 40 crash/reopen rounds in sync and background modes and compares to a model. Mutation check: removing the new-file directory sync in the WAL makes it fail with lost keys.
 **Learned:** the engine was missing a directory fsync after creating WAL segments, which `kill -9` testing can never reveal.
 **Next:** refresh README benchmark numbers; consider injecting write/sync errors in MemFS.
+
+## 2026-11-05: I/O error injection
+**Changed:** `MemFS.SetFault` injects errors into Write (leaving a torn half), Sync and SyncDir. The WAL now records the first write/flush/fsync error and fails every later Append/Sync with it, since appending behind a possibly torn record would make replay stop early and drop later acknowledged writes. README bench numbers refreshed (readrandom roughly doubled with the block cache) and error injection documented.
+**Tests:** WAL unit test for the sticky failure; DB test with ~1.5% random I/O failures across flushes and compactions (sync and background), power cut after the first failure, recovered state must equal the acknowledged model or that plus the failed op. Passes under `-race`.
+**Learned:** the injector and the test's RNG must be separate; background goroutines call the hook concurrently. Not every error means a broken WAL (a failed flush after a good append leaves the log intact), so the DB test does not assert write refusal.
+**Next:** surface flush/compaction I/O errors more explicitly (retry or bgErr in sync mode), fault-inject SSTable reads, maybe a compaction/flush mid-failure test.
