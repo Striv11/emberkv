@@ -31,8 +31,8 @@ type MemFS struct {
 	fault   func(op, name string) error
 }
 
-// SetFault installs an error injector. It is called before every Write, Sync
-// and SyncDir with the operation name ("write", "sync", "syncdir") and the
+// SetFault installs an error injector. It is called before every Write, Sync,
+// SyncDir and ReadAt with the operation name ("write", "sync", "syncdir", "read") and the
 // path; a non-nil result is returned to the caller and the operation has no
 // effect, except that a failed "write" first stores half of the data (a torn write), as a real failing disk may. nil removes it.
 func (m *MemFS) SetFault(f func(op, name string) error) {
@@ -189,6 +189,11 @@ func (f *memFile) Read(p []byte) (int, error) {
 func (f *memFile) ReadAt(p []byte, off int64) (int, error) {
 	f.fs.mu.Lock()
 	defer f.fs.mu.Unlock()
+	if f.fs.fault != nil {
+		if err := f.fs.fault("read", f.name); err != nil {
+			return 0, err
+		}
+	}
 	if off >= int64(len(f.n.data)) {
 		return 0, io.EOF
 	}

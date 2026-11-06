@@ -20,3 +20,4 @@ Seven-day arc. Every milestone has acceptance criteria that can be checked by a 
 - [x] Block cache (LRU) and its metrics
 - [x] Snapshots / MVCC reads at a seqnum
 - [x] Prometheus-style stats endpoint
+- [x] Fault-inject SSTable reads: failed reads surface as errors, never as misses

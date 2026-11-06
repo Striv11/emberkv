@@ -85,3 +85,9 @@ Newest entries at the bottom. Each entry records what actually changed, what was
 **Tests:** WAL unit test for the sticky failure; DB test with ~1.5% random I/O failures across flushes and compactions (sync and background), power cut after the first failure, recovered state must equal the acknowledged model or that plus the failed op. Passes under `-race`.
 **Learned:** the injector and the test's RNG must be separate; background goroutines call the hook concurrently. Not every error means a broken WAL (a failed flush after a good append leaves the log intact), so the DB test does not assert write refusal.
 **Next:** surface flush/compaction I/O errors more explicitly (retry or bgErr in sync mode), fault-inject SSTable reads, maybe a compaction/flush mid-failure test.
+
+## 2026-11-06: read-fault injection
+**Changed:** `MemFS.SetFault` now also fires on `ReadAt` (op `"read"`), so SSTable block/footer/index reads can fail. README and PLAN updated.
+**Tests:** `vfs` unit test for the read fault; `TestReadFaultsSurfaceAsErrors` fails a third of disk reads with the block cache off and checks every `Get`/`Scan` either returns the exact model result or the injected error, with enough of both outcomes, and that data is intact after the fault clears. The existing write-fault test also now sees read faults during compaction and still passes. `check.sh` passes.
+**Learned:** no bug found: errors already propagate from `sstable.Reader` through `Get` and the merge iterator's `Err`. The test now guards that.
+**Next:** retry/recovery for transient background flush/compaction errors (bgErr is currently sticky until reopen); fault-inject MANIFEST reads at open.

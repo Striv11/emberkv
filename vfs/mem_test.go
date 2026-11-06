@@ -1,6 +1,7 @@
 package vfs
 
 import (
+	"errors"
 	"io"
 	"math/rand"
 	"os"
@@ -98,5 +99,31 @@ func TestReadDirAndStat(t *testing.T) {
 	}
 	if _, err := m.Stat("/nope"); !os.IsNotExist(err) {
 		t.Fatalf("want not-exist, got %v", err)
+	}
+}
+
+func TestReadFaultFailsReadAtWithoutSideEffects(t *testing.T) {
+	m := NewMem()
+	f, _ := m.OpenFile("/a", os.O_CREATE|os.O_RDWR, 0o644)
+	f.Write([]byte("hello"))
+	boom := errors.New("boom")
+	var ops []string
+	m.SetFault(func(op, name string) error {
+		ops = append(ops, op)
+		if op == "read" {
+			return boom
+		}
+		return nil
+	})
+	buf := make([]byte, 5)
+	if _, err := f.ReadAt(buf, 0); !errors.Is(err, boom) {
+		t.Fatalf("ReadAt err = %v, want boom", err)
+	}
+	m.SetFault(nil)
+	if _, err := f.ReadAt(buf, 0); err != nil || string(buf) != "hello" {
+		t.Fatalf("after clearing fault: %q, %v", buf, err)
+	}
+	if len(ops) != 1 || ops[0] != "read" {
+		t.Fatalf("ops = %v", ops)
 	}
 }
