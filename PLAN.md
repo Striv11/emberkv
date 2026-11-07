@@ -21,3 +21,4 @@ Seven-day arc. Every milestone has acceptance criteria that can be checked by a 
 - [x] Snapshots / MVCC reads at a seqnum
 - [x] Prometheus-style stats endpoint
 - [x] Fault-inject SSTable reads: failed reads surface as errors, never as misses
+- [x] Fault-inject WAL/MANIFEST reads at open; read errors must fail Open, not truncate the log

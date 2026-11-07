@@ -83,3 +83,58 @@ func TestReadFaultsSurfaceAsErrors(t *testing.T) {
 		t.Fatalf("state damaged after read faults\n%s", diff(got, model))
 	}
 }
+
+// Read errors while opening (WAL or MANIFEST replay) must fail Open and must
+// not lose data: once the fault clears, every acknowledged write is back.
+func TestOpenReadFaultsDoNotLoseData(t *testing.T) {
+	fsys := vfs.NewMem()
+	opts := Options{FS: fsys, MemtableSize: 1 << 10, L0Trigger: 4, L1Size: 8 << 10, TargetFileSize: 1 << 10, BlockCacheSize: -1}
+	d, err := Open("/db", opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model := map[string]string{}
+	for i := 0; i < 500; i++ {
+		k, v := fmt.Sprintf("k%03d", i%120), fmt.Sprintf("v%d", i)
+		if err := d.Put([]byte(k), []byte(v)); err != nil {
+			t.Fatal(err)
+		}
+		model[k] = v
+	}
+	d.Close()
+
+	rng := rand.New(rand.NewSource(9))
+	failed := 0
+	for round := 0; round < 40; round++ {
+		fsys.SetFault(func(op, name string) error {
+			if op == "read" && rng.Intn(4) == 0 {
+				return errInjected
+			}
+			return nil
+		})
+		d, err := Open("/db", opts)
+		fsys.SetFault(nil)
+		if err != nil {
+			failed++
+			if !errors.Is(err, errInjected) {
+				t.Fatalf("Open: %v", err)
+			}
+		} else {
+			d.Close()
+		}
+		d, err = Open("/db", opts)
+		if err != nil {
+			t.Fatalf("clean Open: %v", err)
+		}
+		for k, v := range model {
+			got, err := d.Get([]byte(k))
+			if err != nil || string(got) != v {
+				t.Fatalf("round %d: Get(%s) = %q, %v; want %q", round, k, got, err, v)
+			}
+		}
+		d.Close()
+	}
+	if failed == 0 {
+		t.Fatal("no Open failed; fault injection ineffective")
+	}
+}

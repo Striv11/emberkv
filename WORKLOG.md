@@ -91,3 +91,9 @@ Newest entries at the bottom. Each entry records what actually changed, what was
 **Tests:** `vfs` unit test for the read fault; `TestReadFaultsSurfaceAsErrors` fails a third of disk reads with the block cache off and checks every `Get`/`Scan` either returns the exact model result or the injected error, with enough of both outcomes, and that data is intact after the fault clears. The existing write-fault test also now sees read faults during compaction and still passes. `check.sh` passes.
 **Learned:** no bug found: errors already propagate from `sstable.Reader` through `Get` and the merge iterator's `Err`. The test now guards that.
 **Next:** retry/recovery for transient background flush/compaction errors (bgErr is currently sticky until reopen); fault-inject MANIFEST reads at open.
+
+## 2026-11-07: read errors during recovery
+**Changed:** Fault-injecting reads at open found a data-loss bug: WAL replay treated *any* read error as a torn tail, so a transient I/O error truncated the log (and the MANIFEST, which shares the framing) and silently dropped acknowledged writes. `wal.scan` now ends replay only on EOF/short record and returns every other error, so `Open` fails and leaves the file untouched. README and PLAN updated.
+**Tests:** `TestOpenReadErrorDoesNotTruncate` (wal) and `TestOpenReadFaultsDoNotLoseData` (db, 40 rounds of random read faults at open, then a clean open must return every key). Both fail without the fix (db test: lost key). `check.sh` passes.
+**Learned:** "corruption = end of log" is only right for data that was read successfully; I/O errors need to be told apart from bad bytes.
+**Next:** retry/recovery for transient background flush/compaction errors (bgErr is sticky until reopen).

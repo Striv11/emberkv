@@ -111,6 +111,11 @@ func Open(path string, opts Options, replay func(payload []byte) error) (*Log, R
 	return l, info, nil
 }
 
+// isEnd reports whether err means the log simply ended (cleanly or mid-record).
+// Any other error is an I/O failure: treating it as a torn tail would truncate
+// valid, acknowledged records.
+func isEnd(err error) bool { return err == io.EOF || err == io.ErrUnexpectedEOF }
+
 func scan(f vfs.File, replay func([]byte) error) (RecoveryInfo, error) {
 	st, err := f.Stat()
 	if err != nil {
@@ -123,6 +128,9 @@ func scan(f vfs.File, replay func([]byte) error) (RecoveryInfo, error) {
 	var buf []byte
 	for {
 		if _, err := io.ReadFull(r, hdr[:]); err != nil {
+			if !isEnd(err) {
+				return info, fmt.Errorf("wal: read: %w", err)
+			}
 			break // clean EOF or torn header
 		}
 		sum := binary.LittleEndian.Uint32(hdr[0:4])
@@ -135,6 +143,9 @@ func scan(f vfs.File, replay func([]byte) error) (RecoveryInfo, error) {
 		}
 		buf = buf[:n]
 		if _, err := io.ReadFull(r, buf); err != nil {
+			if !isEnd(err) {
+				return info, fmt.Errorf("wal: read: %w", err)
+			}
 			break
 		}
 		if checksum(hdr[4:8], buf) != sum {

@@ -224,3 +224,46 @@ func TestFailedSyncMakesLogPermanentlyFailed(t *testing.T) {
 		t.Fatal("sync after failure must fail")
 	}
 }
+
+// A read error while replaying is not a torn tail: Open must fail and leave
+// the file untouched instead of truncating acknowledged records.
+func TestOpenReadErrorDoesNotTruncate(t *testing.T) {
+	m := vfs.NewMem()
+	l, _, err := Open("/w", Options{FS: m}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 50; i++ {
+		if err := l.Append(record(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := l.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	l.Close()
+	st, _ := m.Stat("/w")
+	size := st.Size()
+
+	boom := errors.New("boom")
+	m.SetFault(func(op, name string) error {
+		if op == "read" {
+			return boom
+		}
+		return nil
+	})
+	if _, _, err := Open("/w", Options{FS: m}, nil); !errors.Is(err, boom) {
+		t.Fatalf("Open err = %v, want boom", err)
+	}
+	m.SetFault(nil)
+	st, _ = m.Stat("/w")
+	if st.Size() != size {
+		t.Fatalf("file truncated from %d to %d by a read error", size, st.Size())
+	}
+	n := 0
+	l, _, err = Open("/w", Options{FS: m}, func([]byte) error { n++; return nil })
+	if err != nil || n != 50 {
+		t.Fatalf("reopen: %d records, %v", n, err)
+	}
+	l.Close()
+}
