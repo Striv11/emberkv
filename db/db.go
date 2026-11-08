@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/Striv11/emberkv/manifest"
 	"github.com/Striv11/emberkv/memtable"
@@ -64,6 +65,10 @@ type Options struct {
 	// FS is the filesystem; nil means the real one. Tests use vfs.MemFS to
 	// simulate power loss.
 	FS vfs.FS
+	// BGRetries is how many times a background flush or compaction retries
+	// building its output tables after an I/O error before the error becomes
+	// sticky. Zero means 3; a negative value disables retries.
+	BGRetries int
 }
 
 // DB is a durable key-value store. It is safe for concurrent use.
@@ -104,7 +109,7 @@ type DB struct {
 	snaps map[uint64]int // live snapshot seqnum -> refcount (guarded by mu)
 
 	// Metrics (atomic; readable without mu).
-	nPuts, nDeletes, nGets, nScans, nFlushes, nCompactions atomic.Uint64
+	nPuts, nDeletes, nGets, nScans, nFlushes, nCompactions, nBGRetries atomic.Uint64
 }
 
 func walPath(dir string, num uint64) string {
@@ -142,6 +147,9 @@ func Open(dir string, opts Options) (*DB, error) {
 	}
 	if opts.L0Trigger == 0 {
 		opts.L0Trigger = 4
+	}
+	if opts.BGRetries == 0 {
+		opts.BGRetries = 3
 	}
 	if opts.L1Size <= 0 {
 		opts.L1Size = 10 << 20
@@ -417,10 +425,19 @@ func (d *DB) flushLoop() {
 		d.next++
 		d.mu.Unlock()
 
-		meta, err := d.writeTable(imm, num)
+		var meta manifest.FileMeta
 		var r *sstable.Reader
-		if err == nil {
+		err := d.retryBuild(func() error {
+			d.fs.Remove(sstPath(d.dir, num)) // leftovers of a failed attempt
+			var err error
+			if meta, err = d.writeTable(imm, num); err != nil {
+				return err
+			}
 			r, err = d.openTable(num)
+			return err
+		})
+		if err != nil {
+			d.fs.Remove(sstPath(d.dir, num))
 		}
 
 		d.mu.Lock()
@@ -704,4 +721,25 @@ func (d *DB) scanAtLocked(start, end []byte, seq uint64, fn func(key, value []by
 		}
 	}
 	return u.Err()
+}
+
+// retryBuild runs fn, retrying with a short backoff when it fails and the DB
+// is still open. Only the table-building step of a background job is retried:
+// it touches no shared state, so a retry is safe. Installing the result (the
+// MANIFEST edit) is never retried, because a failed append may still have
+// reached the disk.
+func (d *DB) retryBuild(fn func() error) error {
+	err := fn()
+	for i := 0; err != nil && i < d.opts.BGRetries; i++ {
+		time.Sleep(time.Duration(i+1) * 2 * time.Millisecond)
+		d.mu.RLock()
+		closed := d.closed
+		d.mu.RUnlock()
+		if closed {
+			return err
+		}
+		d.nBGRetries.Add(1)
+		err = fn()
+	}
+	return err
 }

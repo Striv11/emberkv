@@ -12,6 +12,7 @@ type LevelStats struct {
 type Stats struct {
 	Puts, Deletes, Gets, Scans uint64 // operations since Open
 	Flushes, Compactions       uint64 // completed since Open
+	BGRetries                  uint64 // background build attempts retried after an error
 	MemtableBytes              int64
 	LastSeq                    uint64
 	Levels                     [numLevels]LevelStats
@@ -25,7 +26,7 @@ func (d *DB) Stats() Stats {
 	s := Stats{
 		Puts: d.nPuts.Load(), Deletes: d.nDeletes.Load(),
 		Gets: d.nGets.Load(), Scans: d.nScans.Load(),
-		Flushes: d.nFlushes.Load(), Compactions: d.nCompactions.Load(),
+		Flushes: d.nFlushes.Load(), Compactions: d.nCompactions.Load(), BGRetries: d.nBGRetries.Load(),
 		MemtableBytes: int64(d.mem.Size()),
 		LastSeq:       d.seq,
 	}

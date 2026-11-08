@@ -24,6 +24,7 @@ func Write(w io.Writer, s db.Stats) error {
 	emit("emberkv_scans_total", "counter", "Scan operations since open.", s.Scans)
 	emit("emberkv_flushes_total", "counter", "Memtable flushes since open.", s.Flushes)
 	emit("emberkv_compactions_total", "counter", "Compactions since open.", s.Compactions)
+	emit("emberkv_background_retries_total", "counter", "Background flush/compaction builds retried after an I/O error.", s.BGRetries)
 	emit("emberkv_memtable_bytes", "gauge", "Approximate memtable size.", s.MemtableBytes)
 	emit("emberkv_last_sequence", "gauge", "Highest assigned sequence number.", s.LastSeq)
 	emit("emberkv_block_cache_hits_total", "counter", "Block cache hits.", s.Cache.Hits)

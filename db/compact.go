@@ -372,7 +372,22 @@ func (d *DB) compactLoop() {
 		}
 		d.mu.Unlock()
 
-		outputs, err := d.buildCompaction(c, alloc)
+		var outputs []manifest.FileMeta
+		first := true
+		err := d.retryBuild(func() error {
+			if !first { // iterators are single-use: rebuild them
+				d.mu.RLock()
+				c.srcs = c.srcs[:0]
+				for _, n := range c.all {
+					c.srcs = append(c.srcs, d.tables[n].NewIterator())
+				}
+				d.mu.RUnlock()
+			}
+			first = false
+			var err error
+			outputs, err = d.buildCompaction(c, alloc)
+			return err
+		})
 
 		d.mu.Lock()
 		if err == nil && d.closed {

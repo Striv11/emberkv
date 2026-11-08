@@ -97,3 +97,9 @@ Newest entries at the bottom. Each entry records what actually changed, what was
 **Tests:** `TestOpenReadErrorDoesNotTruncate` (wal) and `TestOpenReadFaultsDoNotLoseData` (db, 40 rounds of random read faults at open, then a clean open must return every key). Both fail without the fix (db test: lost key). `check.sh` passes.
 **Learned:** "corruption = end of log" is only right for data that was read successfully; I/O errors need to be told apart from bad bytes.
 **Next:** retry/recovery for transient background flush/compaction errors (bgErr is sticky until reopen).
+
+## 2026-11-08: retry transient background errors
+**Changed:** A background flush or compaction used to turn any I/O error into a sticky `bgErr` that rejected every later write. The table-building step now goes through `retryBuild` (`Options.BGRetries`, default 3, negative disables; backoff 2/4/6 ms, stops if the DB closes). Failed attempts' files are removed, and compaction rebuilds its single-use iterators. The MANIFEST install is deliberately not retried. New `Stats.BGRetries` and `emberkv_background_retries_total` metric; README and PLAN updated.
+**Tests:** two failing SST fsyncs during a background fill are absorbed (data intact, no `.tmp` left, retries counted); with `BGRetries: -1` the same fault is still sticky. Pass under `-race`.
+**Learned:** only the pure build phase is safe to retry; a failed manifest append may be durable, so re-applying could add the data twice.
+**Next:** a retry story for MANIFEST install failures (reopen the manifest and verify the edit), or a stats/bench docs polish.
